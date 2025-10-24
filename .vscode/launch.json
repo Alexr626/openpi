@@ -1,0 +1,112 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "uv compute norm stats pi 0.5 fine_tuned",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/compute_norm_stats.py",
+            "args": [
+                "--config-name",
+                "pi05_piper_base"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "uv fine_tune pi 0.5",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/train_pytorch.py",
+            "args": [
+                "pi05_piper",
+                "--exp_name",
+                "object_transport_finetune",
+                "--save_interval",
+                "100",
+                "--batch-size",
+                "8",
+                "--num-workers",
+                "1",
+                "--use-8bit-adam"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "uv run openpi server pi 0.5 finetuned",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/serve_policy.py",
+            "args": [
+                "policy:checkpoint",
+                "--policy.config",
+                "pi05_piper_finetuned",
+                "--policy.dir",
+                "/home/alex/dev/openpi/checkpoints/pi05_piper/object_transport_finetune/5000"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "uv convert to pytorch pi 0.5 base",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/convert_jax_model_to_pytorch.py",
+            "args": [
+                "--checkpoint_dir",
+                "/home/alex/.cache/openpi/openpi-assets/checkpoints/pi05_base/",
+                "--config_name",
+                "pi05_piper_base",
+                "--output_path",
+                "/home/alex/dev/openpi/checkpoints/pi05_piper/base_model"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "uv compute norm stats pi 0.5 base",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/compute_norm_stats.py",
+            "args": [
+                "--config-name",
+                "pi05_piper_base"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "uv run openpi server pi 0.5 base",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/serve_policy.py",
+            "args": [
+                "policy:checkpoint",
+                "--policy.config",
+                "pi05_piper_base",
+                "--policy.dir",
+                "/home/alex/dev/openpi/checkpoints/pi05_piper/base_model"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "uv create lerobot dataset",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/vla/pi/convert_piper_data_to_lerobot.py",
+            "args": [
+                "--raw_dir",
+                "data",
+                "--repo-id",
+                "aromanus/openpi_PiPER_demo",
+                "--task",
+                "object_transportation",
+                "--push-to-hub"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        }
+    ]
+}

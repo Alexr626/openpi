@@ -27,6 +27,8 @@ import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
+import openpi.policies.piper_policy as piper_policy
+
 
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
@@ -412,6 +414,61 @@ class RLDSDroidDataConfig(DataConfigFactory):
             action_space=self.action_space,
             filter_dict_path=self.filter_dict_path,
         )
+    
+@dataclasses.dataclass(frozen=True)
+class PiPERDataConfig(DataConfigFactory):
+    """
+    This config is used to configure transforms that are applied at various parts of the data pipeline.
+    """
+
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # The repack transform simply remaps key names here.
+        # I keep it here as an example and to align naming with the original notation
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/imgs/top_camera": "observation.images.top_camera",
+                        "observation/imgs/left_camera": "observation.images.left_camera",
+                        "observation/imgs/right_camera": "observation.images.right_camera",
+                        "observation/state": "observation.state",
+                        "action": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        # The data transforms are applied to the data coming from the dataset *and* during inference.
+        data_transforms = _transforms.Group(
+            inputs=[piper_policy.PiPERInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            outputs=[piper_policy.PiPEROutputs()],
+        )
+
+        # PiPER actions dim is 14, first 6 are left arm joints and 8 to 13 are right arm joints that should be converted to delta actions
+        # 7th and 14th are grippers that should be left unchanged.
+        # delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+        delta_action_mask = _transforms.make_bool_mask(14)
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+
+        # Model transforms include things like tokenizing the prompt and action targets
+        # You do not need to change anything here for your own dataset.
+        model_transforms = ModelTransformFactory()(model_config)
+
+        # We return all data transforms for training and inference. No need to change anything here.
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -524,6 +581,8 @@ class TrainConfig:
     # eg. if total device is 4 and fsdp devices is 2; then the model will shard to 2 devices and run
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
+
+    use_8bit_adam: bool = False
 
     @property
     def assets_dirs(self) -> pathlib.Path:
@@ -960,6 +1019,47 @@ _CONFIGS = [
     # RoboArena configs.
     #
     *roboarena_config.get_roboarena_configs(),
+    TrainConfig(
+        name="pi05_piper_finetuned",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=4, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        # assets_base_dir='/home/alex/dev/openpi/checkpoints/pi05_piper/object_transport_finetune/5000/assets',
+        data=PiPERDataConfig(
+            repo_id='aromanus/openpi_PiPER_demo',
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),   
+        pytorch_weight_path='/home/alex/dev/openpi/checkpoints/pi05_piper/object_transport_finetune/5000',
+        num_train_steps=5_000,
+        use_8bit_adam=True
+        # num_workers=0
+    ),
+    TrainConfig(
+        name="pi05_piper_base",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=4, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=PiPERDataConfig(
+            assets=AssetsConfig(
+                assets_dir="/home/alex/dev/openpi/assets",
+                asset_id='pi05_piper_base/aromanus/openpi_PiPER_demo'
+            ),
+            repo_id='aromanus/openpi_PiPER_demo',
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),   
+        num_train_steps=5_000,
+        use_8bit_adam=True
+        # num_workers=0
+    ),
+    TrainConfig(
+        name="pi0_piper",
+        model=pi0_config.Pi0Config(action_horizon=8),
+        data=PiPERDataConfig(
+            repo_id='aromanus/openpi_PiPER_demo',
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),   
+        num_train_steps=5_000,
+        policy_metadata={"reset_pose": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0]},
+    )
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

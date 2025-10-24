@@ -455,13 +455,33 @@ def train_loop(config: _config.TrainConfig):
     end_lr = config.lr_schedule.decay_lr
 
     # Create optimizer with config parameters
-    optim = torch.optim.AdamW(
-        model.parameters(),
-        lr=peak_lr,
-        betas=(config.optimizer.b1, config.optimizer.b2),
-        eps=config.optimizer.eps,
-        weight_decay=config.optimizer.weight_decay,
-    )
+    optim = None
+    if config.use_8bit_adam:
+        import bitsandbytes as bnb
+        optim = bnb.optim.AdamW8bit(
+            model.parameters(),
+            lr=peak_lr,
+            betas=(config.optimizer.b1, config.optimizer.b2),
+            weight_decay=config.optimizer.weight_decay,
+            eps=config.optimizer.eps
+        )
+
+        # move all optimizer state tensors to CPU
+        # increse step exeecution time but save GPU memory
+        for state in optim.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.cpu()
+
+    else:
+    # Create optimizer with config parameters
+        optim = torch.optim.AdamW(
+            model.parameters(),
+            lr=peak_lr,
+            betas=(config.optimizer.b1, config.optimizer.b2),
+            eps=config.optimizer.eps,
+            weight_decay=config.optimizer.weight_decay
+        )
 
     # Load checkpoint if resuming
     global_step = 0
