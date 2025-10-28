@@ -8,7 +8,7 @@
             "program": "${workspaceFolder}/scripts/compute_norm_stats.py",
             "args": [
                 "--config-name",
-                "pi05_piper_base"
+                "pi05_piper"
             ],
             "console": "integratedTerminal",
             "justMyCode": false
@@ -21,7 +21,7 @@
             "args": [
                 "pi05_piper",
                 "--exp_name",
-                "object_transport_finetune",
+                "object_transport_finetune_2",
                 "--save_interval",
                 "100",
                 "--batch-size",
@@ -43,7 +43,7 @@
                 "--policy.config",
                 "pi05_piper_finetuned",
                 "--policy.dir",
-                "/home/alex/dev/openpi/checkpoints/pi05_piper/object_transport_finetune/5000"
+                "/home/alex/dev/openpi/checkpoints/pi05_piper/object_transport_finetune_2/5000"
             ],
             "console": "integratedTerminal",
             "justMyCode": false
@@ -57,7 +57,7 @@
                 "--checkpoint_dir",
                 "/home/alex/.cache/openpi/openpi-assets/checkpoints/pi05_base/",
                 "--config_name",
-                "pi05_piper_base",
+                "pi05_piper",
                 "--output_path",
                 "/home/alex/dev/openpi/checkpoints/pi05_piper/base_model"
             ],
@@ -71,7 +71,7 @@
             "program": "${workspaceFolder}/scripts/compute_norm_stats.py",
             "args": [
                 "--config-name",
-                "pi05_piper_base"
+                "pi05_piper"
             ],
             "console": "integratedTerminal",
             "justMyCode": false
@@ -84,7 +84,7 @@
             "args": [
                 "policy:checkpoint",
                 "--policy.config",
-                "pi05_piper_base",
+                "pi05_piper",
                 "--policy.dir",
                 "/home/alex/dev/openpi/checkpoints/pi05_piper/base_model"
             ],
@@ -100,7 +100,7 @@
                 "--raw_dir",
                 "data",
                 "--repo-id",
-                "aromanus/openpi_PiPER_demo",
+                "aromanus/openpi_PiPER_demo_2",
                 "--task",
                 "object_transportation",
                 "--push-to-hub"

@@ -36,7 +36,7 @@ load_dotenv(dotenv_path=".env")
 
 REPO_ID = os.getenv("REPO_ID")
 BASE_ASSETS_DIR = os.getenv("BASE_ASSETS_DIR")
-PYTORCH_FINETUNED_WEIGHT_PATH = os.getenv("PYTORCH_FINETUNED_WEIGHT_PATH")
+PYTORCH_WEIGHT_PATH = os.getenv("PYTORCH_WEIGHT_PATH")
 
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
@@ -1029,34 +1029,35 @@ _CONFIGS = [
     *roboarena_config.get_roboarena_configs(),
     TrainConfig(
         name="pi05_piper_finetuned",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=4, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=PiPERDataConfig(
             repo_id=REPO_ID,
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),   
-        pytorch_weight_path=PYTORCH_FINETUNED_WEIGHT_PATH,
         num_train_steps=5_000,
         use_8bit_adam=True
     ),
+    # Base Pi 0.5 training/fine-tuning config
     TrainConfig(
-        name="pi05_piper_base",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=4, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        name="pi05_piper",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=PiPERDataConfig(
             assets=AssetsConfig(
                 assets_dir=BASE_ASSETS_DIR,
-                asset_id=os.path.join('pi05_piper_base', REPO_ID)
+                asset_id=os.path.join('pi05_piper', REPO_ID)
             ),
             repo_id=REPO_ID,
             base_config=DataConfig(prompt_from_task=True),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),   
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path=PYTORCH_WEIGHT_PATH,
         num_train_steps=5_000,
         use_8bit_adam=True
     ),
     TrainConfig(
         name="pi0_piper",
-        model=pi0_config.Pi0Config(action_horizon=8),
+        model=pi0_config.Pi0Config(action_horizon=32),
         data=PiPERDataConfig(
             repo_id=REPO_ID,
             base_config=DataConfig(prompt_from_task=True),
