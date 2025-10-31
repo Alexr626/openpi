@@ -37,30 +37,16 @@ class PiPERInputs(transforms.DataTransformFn):
 
     action_dim: int
 
-    # If true, this will convert the joint and gripper values from the PiPER space to
-    # the space used by the pi internal runtime which was used to train the base model.
-    adapt_to_pi: bool = True
-
     # The expected cameras names. All input cameras must be in this set. Missing cameras will be
     # replaced with black images and the corresponding `image_mask` will be set to False.
     EXPECTED_CAMERAS: ClassVar[tuple[str, ...]] = ("top_camera", "left_camera", "right_camera")
 
     model_type: _model.ModelType = _model.ModelType.PI05
-    
-    # piper_to_aloha = PiperToAlohaAdapter()
-
 
     def __call__(self, data: dict) -> dict:
         # Transform state to match Pi 0's expected format (apply joint flipping and gripper conversion)
         state = data["observation/state"]
 
-        # Adapt piper sensor data to Aloha compatible format
-        # state[:6] = self.piper_to_aloha.normalize_piper_to_aloha_space(state[:6])
-        # state[7:13] = self.piper_to_aloha.normalize_piper_to_aloha_space(state[7:13])
-        # state = _decode_state(state, adapt_to_pi=self.adapt_to_pi)
-
-        ## I have 3 cameras and it is not perfectly fit the type of cameras Pi0 uses
-        ## So I pass the front image instead of the right wrist image - it still works
         base_image = _parse_image(data["observation/imgs/top_camera"])
         right_image = _parse_image(data["observation/imgs/right_camera"])
         left_image = _parse_image(data["observation/imgs/left_camera"])
@@ -101,18 +87,11 @@ class PiPERInputs(transforms.DataTransformFn):
 class PiPEROutputs(transforms.DataTransformFn):
     """Outputs for the PiPER policy."""
 
-    # If true, this will convert the joint and gripper values from the pi internal runtime space
-    # back to the PiPER space for execution.
-    adapt_to_pi: bool = True
-
-    # piper_to_aloha = PiperToAlohaAdapter()
-
-
     def __call__(self, data: dict) -> dict:
         # Only return the first 14 dims.
         actions = np.asarray(data["actions"][:, :14])
-        # Transform actions from Pi 0's space back to PiPER's expected format
-        # actions[:, :6] = self.piper_to_aloha.denormalize_aloha_to_piper_space(actions[:, :6])
-        # actions[:, 7:13] = self.piper _to_aloha.denormalize_aloha_to_piper_space(actions[:, 7:13])
-        # actions = _encode_actions(actions, adapt_to_pi=self.adapt_to_pi)
+        # actions_copy = actions.copy()
+
+        # actions[:, :7] = actions_copy[:, 7:]
+        # actions[:, 7:] = actions_copy[:, :7]
         return {"actions": actions}
