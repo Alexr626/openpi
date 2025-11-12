@@ -21,7 +21,7 @@
             "args": [
                 "pi05_piper",
                 "--exp_name",
-                "object_transport_finetune_flipped",
+                "object_transport_finetune",
                 "--save_interval",
                 "100",
                 "--batch-size",
@@ -43,7 +43,7 @@
                 "--policy.config",
                 "pi05_piper_finetuned",
                 "--policy.dir",
-                "/home/alex/dev/openpi/checkpoints/pi05_piper/object_transport_finetune_flipped/4800"
+                "/home/alex/dev/openpi/checkpoints/pi05_piper/object_transport_finetune/1500"
             ],
             "console": "integratedTerminal",
             "justMyCode": false
