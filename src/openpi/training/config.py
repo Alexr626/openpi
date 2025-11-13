@@ -38,7 +38,7 @@ except:
     PIPER_ACTION_HORIZON = 32
 
 
-load_dotenv(dotenv_path=".env")
+load_dotenv(dotenv_path="../.env")
 REPO_ID = os.getenv("REPO_ID")
 BASE_ASSETS_DIR = os.getenv("BASE_ASSETS_DIR")
 PYTORCH_WEIGHT_PATH = os.getenv("PYTORCH_WEIGHT_PATH")
@@ -1046,7 +1046,7 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),   
-        num_train_steps=5_000,
+        num_train_steps=2000,
         use_8bit_adam=True
     ),
     # Base Pi 0.5 training/fine-tuning config
@@ -1063,7 +1063,7 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path=PYTORCH_WEIGHT_PATH,
-        num_train_steps=5_000,
+        num_train_steps=2000,
         use_8bit_adam=True
     ),
     TrainConfig(
@@ -1074,7 +1074,7 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),   
-        num_train_steps=5_000,
+        num_train_steps=2000,
         policy_metadata={"reset_pose": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0]},
     )
 ]
