@@ -1067,6 +1067,22 @@ _CONFIGS = [
         use_8bit_adam=True
     ),
     TrainConfig(
+        name="pi05_piper_arx_asset",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=PIPER_ACTION_HORIZON, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=PiPERDataConfig(
+            assets=AssetsConfig(
+                assets_dir='gs://openpi-assets/checkpoints/pi05_base/assets',
+                asset_id="arx"
+            ),
+            repo_id=REPO_ID,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path=PYTORCH_WEIGHT_PATH,
+        num_train_steps=2000,
+        use_8bit_adam=True,
+    ),
+    TrainConfig(
         name="pi0_piper",
         model=pi0_config.Pi0Config(action_horizon=PIPER_ACTION_HORIZON),
         data=PiPERDataConfig(
