@@ -33,12 +33,14 @@ from dotenv import load_dotenv
 
 # If openpi cloned into piper_bimanual repo, import constants from piper_bimanual
 try:
-    from constants import PIPER_ACTION_HORIZON
+    from constants import PIPER_ACTION_HORIZON, PI05, PI05_PROMPT_SUFFIX
 except:
     PIPER_ACTION_HORIZON = 32
+    PI05 = False
+    PI05_PROMPT_SUFFIX = '<control mode> joint <control mode>'
 
 
-load_dotenv(dotenv_path="../.env")
+load_dotenv(dotenv_path=".env")
 REPO_ID = os.getenv("REPO_ID")
 BASE_ASSETS_DIR = os.getenv("BASE_ASSETS_DIR")
 PYTORCH_WEIGHT_PATH = os.getenv("PYTORCH_WEIGHT_PATH")
@@ -200,7 +202,7 @@ class DataConfigFactory(abc.ABC):
             repo_id=repo_id,
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
-            use_quantile_norm=model_config.model_type != ModelType.PI0,
+            use_quantile_norm=True,
         )
 
     def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:
@@ -438,8 +440,15 @@ class PiPERDataConfig(DataConfigFactory):
 
     action_sequence_keys: Sequence[str] = ("action",)
 
+    pi05: bool = PI05
+
+    default_prompt: str = "Pick up the ball and drop it in the bowl"
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if self.pi05:
+            self.default_prompt = PI05_PROMPT_SUFFIX + self.default_prompt
+
         # The repack transform simply remaps key names here.
         # I keep it here as an example and to align naming with the original notation
         repack_transform = _transforms.Group(
@@ -457,7 +466,7 @@ class PiPERDataConfig(DataConfigFactory):
             ]
         )
 
-        # The data transforms are applied to the data coming from the dataset *and* during inference.
+        # The data transforms are applied to the data coming from the dataset during training *and* during inference.
         data_transforms = _transforms.Group(
             inputs=[piper_policy.PiPERInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
             outputs=[piper_policy.PiPEROutputs()],
@@ -465,16 +474,18 @@ class PiPERDataConfig(DataConfigFactory):
 
         # PiPER actions dim is 14, first 6 are left arm joints and 8 to 13 are right arm joints that should be converted to delta actions
         # 7th and 14th are grippers that should be left unchanged.
-        # delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
-        delta_action_mask = _transforms.make_bool_mask(14)
-        data_transforms = data_transforms.push(
-            inputs=[_transforms.DeltaActions(delta_action_mask)],
-            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
-        )
+        delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+
+        # Pi 0 is trained on delta actions, whereas Pi 0.5 is trained on absolute actions.
+        if not self.pi05:
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
 
         # Model transforms include things like tokenizing the prompt and action targets
         # You do not need to change anything here for your own dataset.
-        model_transforms = ModelTransformFactory()(model_config)
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
         # We return all data transforms for training and inference. No need to change anything here.
         return dataclasses.replace(
@@ -1063,8 +1074,8 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path=PYTORCH_WEIGHT_PATH,
-        num_train_steps=2000,
-        use_8bit_adam=True
+        num_train_steps=5000,
+        use_8bit_adam=True,
     ),
     TrainConfig(
         name="pi05_piper_arx_asset",
@@ -1084,15 +1095,20 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi0_piper",
-        model=pi0_config.Pi0Config(action_horizon=PIPER_ACTION_HORIZON),
+        model=pi0_config.Pi0Config(action_horizon=PIPER_ACTION_HORIZON, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=PiPERDataConfig(
+            assets=AssetsConfig(
+                assets_dir=BASE_ASSETS_DIR,
+                asset_id=os.path.join('pi0_piper', REPO_ID)
+            ),
             repo_id=REPO_ID,
             base_config=DataConfig(prompt_from_task=True),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),   
-        num_train_steps=2000,
-        policy_metadata={"reset_pose": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0]},
-    )
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        pytorch_weight_path=PYTORCH_WEIGHT_PATH,
+        num_train_steps=5000,
+        use_8bit_adam=True
+    ),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
