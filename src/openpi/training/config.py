@@ -33,11 +33,11 @@ from dotenv import load_dotenv
 
 # If openpi cloned into piper_bimanual repo, import constants from piper_bimanual
 try:
-    from constants import PIPER_ACTION_HORIZON, PI05, PI05_PROMPT_SUFFIX
+    from constants import PIPER_ACTION_HORIZON, PI05, PI05_PROMPT_PREFIX
 except:
     PIPER_ACTION_HORIZON = 32
-    PI05 = False
-    PI05_PROMPT_SUFFIX = '<control mode> joint <control mode>'
+    PI05 = True
+    PI05_PROMPT_PREFIX = '<control mode> joint <control mode> '
 
 
 load_dotenv(dotenv_path=".env")
@@ -446,8 +446,6 @@ class PiPERDataConfig(DataConfigFactory):
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        if self.pi05:
-            self.default_prompt = PI05_PROMPT_SUFFIX + self.default_prompt
 
         # The repack transform simply remaps key names here.
         # I keep it here as an example and to align naming with the original notation
@@ -476,16 +474,22 @@ class PiPERDataConfig(DataConfigFactory):
         # 7th and 14th are grippers that should be left unchanged.
         delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
 
+        # Pi 0.5 requires a prompt prefix '<control mode> joint <control mode>' to calculate actions in angular space
+        if self.pi05:
+            # default_prompt = PI05_PROMPT_PREFIX + self.default_prompt
+            default_prompt = self.default_prompt
+
         # Pi 0 is trained on delta actions, whereas Pi 0.5 is trained on absolute actions.
-        if not self.pi05:
+        else:
             data_transforms = data_transforms.push(
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
             )
+            default_prompt = self.default_prompt
 
         # Model transforms include things like tokenizing the prompt and action targets
         # You do not need to change anything here for your own dataset.
-        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+        model_transforms = ModelTransformFactory(default_prompt=default_prompt)(model_config)
 
         # We return all data transforms for training and inference. No need to change anything here.
         return dataclasses.replace(
@@ -1057,8 +1061,10 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),   
-        num_train_steps=2000,
-        use_8bit_adam=True
+        num_train_steps=5000,
+        use_8bit_adam=True,
+        keep_period=5000,
+        save_interval=500
     ),
     # Base Pi 0.5 training/fine-tuning config
     TrainConfig(
@@ -1076,6 +1082,8 @@ _CONFIGS = [
         pytorch_weight_path=PYTORCH_WEIGHT_PATH,
         num_train_steps=5000,
         use_8bit_adam=True,
+        keep_period=5000,
+        save_interval=500
     ),
     TrainConfig(
         name="pi05_piper_arx_asset",
@@ -1090,8 +1098,10 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path=PYTORCH_WEIGHT_PATH,
-        num_train_steps=2000,
+        num_train_steps=5000,
         use_8bit_adam=True,
+        keep_period=5000,
+        save_interval=500
     ),
     TrainConfig(
         name="pi0_piper",
@@ -1107,7 +1117,9 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         pytorch_weight_path=PYTORCH_WEIGHT_PATH,
         num_train_steps=5000,
-        use_8bit_adam=True
+        use_8bit_adam=True,
+        keep_period=5000,
+        save_interval=500
     ),
 ]
 
