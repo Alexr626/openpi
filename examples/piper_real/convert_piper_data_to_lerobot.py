@@ -193,6 +193,77 @@ def get_episode_directories(raw_dir: Path) -> list[Path]:
     return sorted(episode_dirs)
 
 
+def validate_episode_files(episode_dir: Path) -> tuple[bool, list[str]]:
+    """
+    Validate that an episode directory contains all required files.
+
+    Args:
+        episode_dir: Path to episode directory
+
+    Returns:
+        Tuple of (is_valid, missing_files) where is_valid is True if all files are present
+        and missing_files is a list of missing file names
+    """
+    required_files = [
+        "left_camera_color_timestamps.txt",
+        "left_camera-depth.mp4",
+        "left_camera_depth_timestamps.txt",
+        "left_camera.mp4",
+        "machine.jsonc",
+        "rdc-meta.json",
+        "right_camera_color_timestamps.txt",
+        "right_camera-depth.mp4",
+        "right_camera_depth_timestamps.txt",
+        "right_camera.mp4",
+        "robot_act.pkl",
+        "robot_obs.pkl",
+        "top_camera_color_timestamps.txt",
+        "top_camera-depth.mp4",
+        "top_camera_depth_timestamps.txt",
+        "top_camera.mp4",
+    ]
+
+    missing_files = []
+    for filename in required_files:
+        file_path = episode_dir / filename
+        if not file_path.exists():
+            missing_files.append(filename)
+
+    return len(missing_files) == 0, missing_files
+
+
+def validate_all_episodes(episode_dirs: list[Path]) -> None:
+    """
+    Validate that all episode directories contain required files.
+
+    Args:
+        episode_dirs: List of episode directory paths
+
+    Raises:
+        ValueError: If any episode directory is missing required files
+    """
+    invalid_episodes = []
+
+    for ep_dir in episode_dirs:
+        is_valid, missing_files = validate_episode_files(Path(ep_dir))
+        if not is_valid:
+            invalid_episodes.append({
+                "directory": ep_dir,
+                "missing_files": missing_files
+            })
+
+    if invalid_episodes:
+        error_msg = "Found episodes with missing required files:\n\n"
+        for ep_info in invalid_episodes:
+            error_msg += f"Episode: {ep_info['directory']}\n"
+            error_msg += f"Missing files:\n"
+            for missing_file in ep_info['missing_files']:
+                error_msg += f"  - {missing_file}\n"
+            error_msg += "\n"
+
+        raise ValueError(error_msg)
+
+
 # def align_observations_and_actions(
 #     observations: list[dict],
 #     actions: list[dict],
@@ -323,6 +394,7 @@ def port_piper(
     *,
     episodes: list[int] | None = None,
     push_to_hub: bool = False,
+    token: str | None = None,
     mode: Literal["video", "image"] = "video",
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
 ):
@@ -335,6 +407,7 @@ def port_piper(
         task: Task description
         episodes: Optional list of specific episode indices to process
         push_to_hub: Whether to push the dataset to Hugging Face Hub
+        token: Hugging Face access token for pushing to hub
         mode: Whether to use video or image format
         dataset_config: Configuration for dataset creation
     """
@@ -346,6 +419,13 @@ def port_piper(
     if not raw_dir.exists():
         raise ValueError(f"Raw data directory does not exist: {raw_dir}")
 
+    # Validate token is provided if push_to_hub is enabled
+    if push_to_hub and not token:
+        raise ValueError(
+            "Hugging Face token is required when --push-to-hub is enabled. "
+            "Please provide a token using the --token argument."
+        )
+
     # Get all episode directories
     episode_dirs = get_episode_directories(raw_dir)
 
@@ -354,8 +434,13 @@ def port_piper(
 
     print(f"Found {len(episode_dirs)} episodes to process")
 
+    # Validate all episodes have required files before processing
+    print("Validating episode files...")
+    validate_all_episodes(episode_dirs)
+    print("All episodes validated successfully")
+
     # Infer FPS from first episode
-    fps = infer_fps_from_episode(episode_dirs[0])
+    fps = 30
     print(f"Inferred FPS: {fps}")
 
     # Create empty dataset
@@ -382,7 +467,7 @@ def port_piper(
     # Optionally push to hub
     if push_to_hub:
         print("Pushing to Hugging Face Hub...")
-        dataset.push_to_hub()
+        dataset.push_to_hub(token=token)
 
     print(f"Dataset created successfully at {lerobot_path}")
 
