@@ -28,6 +28,7 @@ from src.util.data_util import load_raw_episode_data, load_pickle_file
 
 load_dotenv(dotenv_path=".env")
 HF_LEROBOT_HOME = os.getenv("HF_LEROBOT_HOME")
+HF_ACCESS_TOKEN = os.getenv("HF_ACCESS_TOKEN")
 
 STRICT_ALIGN_FRAMES_OBSV = False
 TRANSFORM_PIPER_TO_ALOHA_CONVENTION = False
@@ -407,7 +408,7 @@ def port_piper(
         task: Task description
         episodes: Optional list of specific episode indices to process
         push_to_hub: Whether to push the dataset to Hugging Face Hub
-        token: Hugging Face access token for pushing to hub
+        token: Hugging Face access token for pushing to hub (defaults to HF_ACCESS_TOKEN from .env)
         mode: Whether to use video or image format
         dataset_config: Configuration for dataset creation
     """
@@ -419,11 +420,15 @@ def port_piper(
     if not raw_dir.exists():
         raise ValueError(f"Raw data directory does not exist: {raw_dir}")
 
+    # Use token from environment if not provided
+    if token is None:
+        token = HF_ACCESS_TOKEN
+
     # Validate token is provided if push_to_hub is enabled
     if push_to_hub and not token:
         raise ValueError(
             "Hugging Face token is required when --push-to-hub is enabled. "
-            "Please provide a token using the --token argument."
+            "Please set HF_ACCESS_TOKEN in your .env file or provide a token using the --token argument."
         )
 
     # Get all episode directories
