@@ -28,14 +28,15 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
 import openpi.policies.piper_policy as piper_policy
+import openpi.policies.wd_policy as wd_policy
 import os
 from dotenv import load_dotenv
 
 # If openpi cloned into piper_bimanual repo, import constants from piper_bimanual
 try:
-    from constants import PIPER_ACTION_HORIZON, PI05, PI05_PROMPT_PREFIX
+    from constants import ACTION_HORIZON, PI05, PI05_PROMPT_PREFIX
 except:
-    PIPER_ACTION_HORIZON = 32
+    ACTION_HORIZON = 32
     PI05 = True
     PI05_PROMPT_PREFIX = '<control mode> joint <control mode> '
 
@@ -499,6 +500,47 @@ class PiPERDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys
         )
+    
+@dataclasses.dataclass(frozen=True)
+class LeRobotPickAndPlaceDataConfig(DataConfigFactory):
+    """
+    Example data config for custom DROID dataset in LeRobot format.
+    To convert your custom DROID dataset (<10s of hours) to LeRobot format, see examples/droid/convert_droid_data_to_lerobot.py
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "image": "image",
+                        "wrist_image": "wrist_image",
+                        "state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[wd_policy.WdInputs(model_type=model_config.model_type)],
+            outputs=[wd_policy.WdOutputs()],
+        )
+        delta_action_mask = _transforms.make_bool_mask(7, -1)
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1051,7 +1093,7 @@ _CONFIGS = [
     *roboarena_config.get_roboarena_configs(),
     TrainConfig(
         name="pi05_piper_finetuned",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=PIPER_ACTION_HORIZON, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=ACTION_HORIZON, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=PiPERDataConfig(
             assets=AssetsConfig(
                 assets_dir=os.path.join(FINETUNED_CHECKPOINT_DIR, 'assets'),
@@ -1069,7 +1111,7 @@ _CONFIGS = [
     # Base Pi 0.5 training/fine-tuning config
     TrainConfig(
         name="pi05_piper",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=PIPER_ACTION_HORIZON, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=ACTION_HORIZON, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=PiPERDataConfig(
             assets=AssetsConfig(
                 assets_dir=BASE_ASSETS_DIR,
@@ -1086,35 +1128,52 @@ _CONFIGS = [
         save_interval=500
     ),
     TrainConfig(
-        name="pi05_piper_arx_asset",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=PIPER_ACTION_HORIZON, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        name="pi0_piper",
+        model=pi0_config.Pi0Config(action_horizon=ACTION_HORIZON, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=PiPERDataConfig(
             assets=AssetsConfig(
-                assets_dir='gs://openpi-assets/checkpoints/pi05_base/assets',
-                asset_id="arx"
+                assets_dir=BASE_ASSETS_DIR,
+                asset_id=os.path.join('pi0', REPO_ID)
             ),
             repo_id=REPO_ID,
             base_config=DataConfig(prompt_from_task=True),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         pytorch_weight_path=PYTORCH_WEIGHT_PATH,
         num_train_steps=5000,
         use_8bit_adam=True,
         keep_period=5000,
         save_interval=500
     ),
-    TrainConfig(
-        name="pi0_piper",
-        model=pi0_config.Pi0Config(action_horizon=PIPER_ACTION_HORIZON, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
-        data=PiPERDataConfig(
+        TrainConfig(
+        name="pi05_franka_finetuned",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=ACTION_HORIZON, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotPickAndPlaceDataConfig(
             assets=AssetsConfig(
-                assets_dir=BASE_ASSETS_DIR,
-                asset_id=os.path.join('pi0_piper', REPO_ID)
+                assets_dir=os.path.join(FINETUNED_CHECKPOINT_DIR, 'assets'),
+                asset_id=os.path.join('pi05_franka', REPO_ID)
             ),
             repo_id=REPO_ID,
             base_config=DataConfig(prompt_from_task=True),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        pytorch_weight_path=FINETUNED_CHECKPOINT_DIR,
+        num_train_steps=5000,
+        use_8bit_adam=True,
+        keep_period=5000,
+        save_interval=500
+    ),
+        TrainConfig(
+        name="pi05_franka",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=ACTION_HORIZON, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotPickAndPlaceDataConfig(
+            assets=AssetsConfig(
+                assets_dir=BASE_ASSETS_DIR,
+                asset_id=os.path.join('pi05_franka', REPO_ID)
+            ),
+            repo_id=REPO_ID,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path=PYTORCH_WEIGHT_PATH,
         num_train_steps=5000,
         use_8bit_adam=True,

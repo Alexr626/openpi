@@ -12,11 +12,14 @@ import numpy as np
 from openpi_client import base_policy as _base_policy
 import torch
 from typing_extensions import override
+from transformers import AutoTokenizer, AutoProcessor
 
 from openpi import transforms as _transforms
 from openpi.models import model as _model
 from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
+from openpi.models_pytorch.CAST_helpers import pad_tokens, get_text_based_hidden_states, SteeringHook
+from constants import CONDITION_PROMPT, POSITIVE_EXAMPLE, NEGATIVE_EXAMPLE, ACTIVATION_ENGINEERING, CAST, LAYER_IDX, ALPHA
 
 BasePolicy: TypeAlias = _base_policy.BasePolicy
 
@@ -64,6 +67,27 @@ class Policy(BasePolicy):
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             self._rng = rng or jax.random.key(0)
 
+        if ACTIVATION_ENGINEERING:
+            self.tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
+            positive_ex_padded, negative_ex_padded = pad_tokens(tokenizer=self.tokenizer,
+                                                                prompt_add_raw=POSITIVE_EXAMPLE, prompt_sub_raw=NEGATIVE_EXAMPLE)
+            self.positive_steering_vector = get_text_based_hidden_states(model=self._model,
+                                                                         text=positive_ex_padded,
+                                                                         layer_idx=LAYER_IDX,
+                                                                         tokenizer=self.tokenizer)
+            
+            self.negative_steering_vector = get_text_based_hidden_states(model=self._model,
+                                                                         text=negative_ex_padded,
+                                                                         layer_idx=LAYER_IDX,
+                                                                         tokenizer=self.tokenizer)
+            
+            self.steering_vector = self.positive_steering_vector - self.negative_steering_vector
+
+            self.steering_hook = SteeringHook(model=self._model,
+                                              steering_vec=self.steering_vector,
+                                              alpha=ALPHA,
+                                              layer_idx=LAYER_IDX)
+
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
@@ -89,6 +113,7 @@ class Policy(BasePolicy):
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
+
         outputs = {
             "state": inputs["state"],
             "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),

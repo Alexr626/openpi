@@ -1,12 +1,51 @@
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoProcessor
-from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
-from transformers import PaliGemmaForConditionalGeneration
+from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
+import openpi.models.gemma as _gemma
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
 
-def get_text_and_vision_based_hidden_states(model: PaliGemmaWithExpertModel, image, text, layer_idx, processor):
+def pad_tokens(tokenizer: AutoTokenizer,
+               prompt_add_raw: str,
+               prompt_sub_raw: str):
+    """Pad prompts to equal token length using the tokenizer's pad token.
+
+    Args:
+        tokenizer: A tokenizer loaded via AutoTokenizer.from_pretrained('<paligemma_path>')
+        prompt_add_raw: The positive/additive prompt string
+        prompt_sub_raw: The negative/subtractive prompt string
+
+    Returns:
+        Tuple of (padded_prompt_add, padded_prompt_sub) as strings
+    """
+    # Tokenize both prompts
+    tokens_add = tokenizer(prompt_add_raw, return_tensors="pt")["input_ids"]
+    tokens_sub = tokenizer(prompt_sub_raw, return_tensors="pt")["input_ids"]
+
+    max_len = max(tokens_add.shape[1], tokens_sub.shape[1])
+
+    # Get the pad token ID
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = tokenizer.eos_token_id  # Fallback to EOS
+
+    # Pad the shorter sequence
+    if tokens_add.shape[1] < max_len:
+        padding = torch.full((1, max_len - tokens_add.shape[1]), pad_token_id, dtype=tokens_add.dtype, device=tokens_add.device)
+        tokens_add = torch.cat([tokens_add, padding], dim=1)
+    elif tokens_sub.shape[1] < max_len:
+        padding = torch.full((1, max_len - tokens_sub.shape[1]), pad_token_id, dtype=tokens_sub.dtype, device=tokens_sub.device)
+        tokens_sub = torch.cat([tokens_sub, padding], dim=1)
+
+    # Convert back to strings for compatibility with existing code
+    prompt_add = tokenizer.decode(tokens_add[0], skip_special_tokens=False)
+    prompt_sub = tokenizer.decode(tokens_sub[0], skip_special_tokens=False)
+
+    return prompt_add, prompt_sub
+
+
+def get_text_and_vision_based_hidden_states(model: PI0Pytorch, image, text, layer_idx, processor):
     """
     Get activations at specific layer in Paligemma decoder
     
@@ -22,7 +61,7 @@ def get_text_and_vision_based_hidden_states(model: PaliGemmaWithExpertModel, ima
         text=text,
         images=image,
         return_tensors="pt"
-    ).to(model.paligemma.device)
+    ).to(model.paligemma_with_expert.paligemma.device)
     
     # inputs will contain:
     # - input_ids: text tokens with image placeholder tokens
@@ -36,18 +75,18 @@ def get_text_and_vision_based_hidden_states(model: PaliGemmaWithExpertModel, ima
         activations['hidden'] = (output[0] if isinstance(output, tuple) else output).detach()
     
     # Hook into the Gemma decoder layer (not vision encoder!)
-    handle = model.paligemma.language_model.layers[layer_idx].register_forward_hook(hook)
+    handle = model.paligemma_with_expert.paligemma.language_model.layers[layer_idx].mlp.down_proj.register_forward_hook(hook)
     
     with torch.no_grad():
         with torch.autocast('cuda'):
-            _ = model.paligemma(**inputs)  # Forward pass triggers hook
+            _ = model.paligemma_with_expert.paligemma(**inputs)  # Forward pass triggers hook
     
     handle.remove()
     
     return activations['hidden']
 
 
-def get_text_based_hidden_states(model: PaliGemmaWithExpertModel, text, layer_idx, tokenizer):
+def get_text_based_hidden_states(model: PI0Pytorch, text, layer_idx, tokenizer):
     """
     Get activations at specific layer in Paligemma decoder
     
@@ -62,7 +101,7 @@ def get_text_based_hidden_states(model: PaliGemmaWithExpertModel, text, layer_id
     inputs = tokenizer(
         text=text,
         return_tensors="pt",
-    ).to(model.paligemma.device)
+    ).to(model.paligemma_with_expert.paligemma.device)
     
     # inputs will contain:
     # - input_ids: text tokens with image placeholder tokens
@@ -76,26 +115,57 @@ def get_text_based_hidden_states(model: PaliGemmaWithExpertModel, text, layer_id
         activations['hidden'] = (output[0] if isinstance(output, tuple) else output).detach()
     
     # Hook into the Gemma decoder layer (not vision encoder!)
-    handle = model.paligemma.language_model.layers[layer_idx].register_forward_hook(hook)
+    handle = model.paligemma_with_expert.paligemma.language_model.layers[layer_idx].mlp.down_proj.register_forward_hook(hook)
     
     with torch.no_grad():
         with torch.autocast('cuda'):
-            _ = model.paligemma(**inputs)  # Forward pass triggers hook
+            _ = model.paligemma_with_expert.paligemma(**inputs)  # Forward pass triggers hook
     
     handle.remove()
     
     return activations['hidden']
 
 
+class SteeringHook:
+    """Apply steering during generation"""
+    def __init__(self, model: PI0Pytorch, steering_vec, alpha, layer_idx):
+        self.model = model
+        self.steering_vec = steering_vec.to(model.paligemma_with_expert.paligemma.device)
+        self.alpha = alpha
+        self.layer_idx = layer_idx
+        self.handle = None
+    
+    def hook_fn(self, module, input, output):
+        print("ADDING STEERING VECTOR")
+        hidden = output[0] if isinstance(output, tuple) else output
+        seq_len = hidden.shape[1]
+        steer_len = self.steering_vec.shape[1]
+        
+        if seq_len >= steer_len:
+            hidden[:, -steer_len:, :] += self.alpha * self.steering_vec
+        else:
+            hidden += self.alpha * self.steering_vec[:, :seq_len, :]
+        
+        return (hidden,) + output[1:] if isinstance(output, tuple) else hidden
+    
+    def register(self):
+        self.handle = self.model.paligemma_with_expert.paligemma.language_model.layers[self.layer_idx].mlp.down_proj.register_forward_hook(self.hook_fn)
+    
+    
+    def remove(self):
+        if self.handle:
+            self.handle.remove()
+
+
 def generate(prompt, 
-             model: PaliGemmaWithExpertModel,
+             model: PI0Pytorch,
              tokenizer, 
              steering_vec=None, 
              alpha=0, 
              layer=20,
              max_tokens=20):
     """Generate text with optional steering"""
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.paligemma.device)
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.paligemma_with_expert.paligemma.device)
     
     hook = None
     if steering_vec is not None:
@@ -104,7 +174,7 @@ def generate(prompt,
     
     try:
         with torch.no_grad():
-            output_ids = model.paligemma.generate(
+            output_ids = model.paligemma_with_expert.paligemma.generate(
                 **inputs,
                 max_new_tokens=max_tokens,
                 do_sample=True,
@@ -117,6 +187,8 @@ def generate(prompt,
         if hook:
             hook.remove()
 
+
+# ------------------------------------------- CAST HELPERS -----------------------------------
 
 def compute_behavior_vector(
     positive_hidden_states: torch.Tensor,
@@ -332,44 +404,10 @@ def apply_conditional_steering(
     return modified_hidden.to(torch.bfloat16)
 
 
-class SteeringHook:
-    """Apply steering during generation"""
-    def __init__(self,
-                 model: PaliGemmaWithExpertModel,
-                 steering_vec,
-                 alpha,
-                 layer_idx):
-
-        self.model = model.paligemma
-        self.steering_vec = steering_vec.to(self.model.device)
-        self.alpha = alpha
-        self.layer_idx = layer_idx
-        self.handle = None
-
-    def hook_fn(self, module, input, output):
-        hidden = output[0] if isinstance(output, tuple) else output
-        seq_len = hidden.shape[1]
-        steer_len = self.steering_vec.shape[1]
-
-        if seq_len >= steer_len:
-            hidden[:, -steer_len:, :] += self.alpha * self.steering_vec
-        else:
-            hidden += self.alpha * self.steering_vec[:, :seq_len, :]
-
-        return (hidden,) + output[1:] if isinstance(output, tuple) else hidden
-
-    def register(self):
-        self.handle = self.model.language_model.layers[self.layer_idx].register_forward_hook(self.hook_fn)
-
-    def remove(self):
-        if self.handle:
-            self.handle.remove()
-
-
 class ConditionalSteeringHook:
     """Apply conditional activation steering during generation"""
     def __init__(self,
-                 model: PaliGemmaWithExpertModel,
+                 model: PI0Pytorch,
                  condition_vec: torch.Tensor,
                  behavior_vec: torch.Tensor,
                  alpha: float,
@@ -388,7 +426,7 @@ class ConditionalSteeringHook:
             threshold: Similarity threshold for activation (default: 0.5)
             use_tanh: Apply tanh to projection (default: True)
         """
-        self.model = model.paligemma
+        self.model = model
         self.condition_vec = condition_vec.to(self.model.device)
         self.behavior_vec = behavior_vec.to(self.model.device)
         self.alpha = alpha
@@ -415,9 +453,18 @@ class ConditionalSteeringHook:
 
     def register(self):
         """Register the hook to the specified layer"""
-        self.handle = self.model.language_model.layers[self.layer_idx].register_forward_hook(self.hook_fn)
+        self.handle = self.model.paligemma_with_expert.paligemma.language_model.layers[self.layer_idx].mlp.down_proj.register_forward_hook(self.hook_fn)
 
     def remove(self):
         """Remove the hook"""
         if self.handle:
             self.handle.remove()
+
+
+if __name__=='__main__':
+    # Load tokenizer for PaliGemma (update path as needed)
+    tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
+
+    # print(pad_tokens(tokenizer=tokenizer,
+    #                  prompt_add_raw=POSITIVE_EXAMPLE,
+    #                  prompt_sub_raw=NEGATIVE_EXAMPLE))
