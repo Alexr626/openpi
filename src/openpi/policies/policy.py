@@ -18,8 +18,8 @@ from openpi import transforms as _transforms
 from openpi.models import model as _model
 from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
-from openpi.models_pytorch.CAST_helpers import pad_tokens, get_text_based_hidden_states, SteeringHook
-from constants import CONDITION_PROMPT, POSITIVE_EXAMPLE, NEGATIVE_EXAMPLE, ACTIVATION_ENGINEERING, CAST, LAYER_IDX, ALPHA
+from openpi.models_pytorch.CAST_helpers import pad_tokens, get_text_based_hidden_states, SteeringHook, MultiLayerSteeringHook
+from constants import CONDITION_PROMPT, POSITIVE_EXAMPLE, NEGATIVE_EXAMPLE, ACTIVATION_ENGINEERING, CAST, LAYER_INDICES, ALPHA
 
 BasePolicy: TypeAlias = _base_policy.BasePolicy
 
@@ -69,24 +69,34 @@ class Policy(BasePolicy):
 
         if ACTIVATION_ENGINEERING:
             self.tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
-            positive_ex_padded, negative_ex_padded = pad_tokens(tokenizer=self.tokenizer,
-                                                                prompt_add_raw=POSITIVE_EXAMPLE, prompt_sub_raw=NEGATIVE_EXAMPLE)
-            self.positive_steering_vector = get_text_based_hidden_states(model=self._model,
-                                                                         text=positive_ex_padded,
-                                                                         layer_idx=LAYER_IDX,
-                                                                         tokenizer=self.tokenizer)
+            positive_ex_padded, negative_ex_padded = pad_tokens(
+                tokenizer=self.tokenizer,
+                prompt_add_raw=POSITIVE_EXAMPLE, 
+                prompt_sub_raw=NEGATIVE_EXAMPLE
+            )
             
-            self.negative_steering_vector = get_text_based_hidden_states(model=self._model,
-                                                                         text=negative_ex_padded,
-                                                                         layer_idx=LAYER_IDX,
-                                                                         tokenizer=self.tokenizer)
+            # Compute steering vectors for each layer
+            steering_vecs = {}
+            for layer_idx in LAYER_INDICES:
+                positive_vec = get_text_based_hidden_states(
+                    model=self._model,
+                    text=positive_ex_padded,
+                    layer_idx=layer_idx,
+                    tokenizer=self.tokenizer
+                )
+                negative_vec = get_text_based_hidden_states(
+                    model=self._model,
+                    text=negative_ex_padded,
+                    layer_idx=layer_idx,
+                    tokenizer=self.tokenizer
+                )
+                steering_vecs[layer_idx] = positive_vec - negative_vec
             
-            self.steering_vector = self.positive_steering_vector - self.negative_steering_vector
-
-            self.steering_hook = SteeringHook(model=self._model,
-                                              steering_vec=self.steering_vector,
-                                              alpha=ALPHA,
-                                              layer_idx=LAYER_IDX)
+            self.steering_hook = MultiLayerSteeringHook(
+                model=self._model,
+                steering_vecs=steering_vecs,
+                alpha=ALPHA  # Same alpha for all, or pass a dict for per-layer alphas
+            )
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]

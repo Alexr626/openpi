@@ -8,7 +8,7 @@ from openpi_client import base_policy as _base_policy
 from openpi_client import msgpack_numpy
 import websockets.asyncio.server as _server
 import websockets.frames
-from constants import CONDITION_PROMPT, POSITIVE_EXAMPLE, NEGATIVE_EXAMPLE, ACTIVATION_ENGINEERING, CAST, LAYER_IDX, ALPHA
+from constants import CONDITION_PROMPT, POSITIVE_EXAMPLE, NEGATIVE_EXAMPLE, ACTIVATION_ENGINEERING, CAST, ALPHA
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +86,7 @@ class WebsocketPolicyServer:
                     reason="Internal server error. Traceback included in previous frame.",
                 )
                 raise
-        if self._policy.steering_hook:
+        if ACTIVATION_ENGINEERING:
             self._policy.steering_hook.remove()
 
 

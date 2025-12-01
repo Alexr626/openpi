@@ -22,7 +22,6 @@ from openpi.models_pytorch.CAST_helpers import (
     compute_behavior_vector,
     ConditionalSteeringHook
 )
-from constants import TASK_DESCRIPTION, CONDITION_PROMPT, POSITIVE_EXAMPLE, NEGATIVE_EXAMPLE
 
 
 # Configuration

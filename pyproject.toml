@@ -39,7 +39,8 @@ dependencies = [
     "rich>=14.0.0",
     "polars>=1.30.0",
     "bitsandbytes==0.48.1",
-    "python-dotenv"
+    "python-dotenv",
+    "tensorflow_datasets"
 ]
 
 

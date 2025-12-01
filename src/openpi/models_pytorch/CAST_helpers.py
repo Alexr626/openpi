@@ -156,6 +156,61 @@ class SteeringHook:
         if self.handle:
             self.handle.remove()
 
+class MultiLayerSteeringHook:
+    """Apply steering during generation across multiple layers"""
+    def __init__(self, model: PI0Pytorch, steering_vecs: dict[int, torch.Tensor], alpha: float | dict[int, float]):
+        """
+        Args:
+            model: The PI0Pytorch model
+            steering_vecs: Dict mapping layer_idx -> steering vector for that layer
+            alpha: Either a single float (same alpha for all layers) or dict mapping layer_idx -> alpha
+        """
+        self.model = model
+        self.device = model.paligemma_with_expert.paligemma.device
+        self.steering_vecs = {idx: vec.to(self.device) for idx, vec in steering_vecs.items()}
+        
+        # Handle alpha as single value or per-layer dict
+        if isinstance(alpha, (int, float)):
+            self.alphas = {idx: alpha for idx in steering_vecs.keys()}
+        else:
+            self.alphas = alpha
+            
+        self.handles: dict[int] = {}
+    
+    def _make_hook_fn(self, layer_idx: int):
+        """Create a hook function for a specific layer"""
+        steering_vec = self.steering_vecs[layer_idx]
+        alpha = self.alphas[layer_idx]
+        
+        def hook_fn(module, input, output):
+            print(f"ADDING STEERING VECTOR at layer {layer_idx}")
+            hidden = output[0] if isinstance(output, tuple) else output
+            seq_len = hidden.shape[1]
+            steer_len = steering_vec.shape[1]
+            
+            if seq_len >= steer_len:
+                hidden[:, -steer_len:, :] += alpha * steering_vec
+            else:
+                hidden += alpha * steering_vec[:, :seq_len, :]
+            
+            return (hidden,) + output[1:] if isinstance(output, tuple) else hidden
+        
+        return hook_fn
+    
+    def register(self):
+        """Register hooks to all specified layers"""
+        for layer_idx in self.steering_vecs.keys():
+            layer = self.model.paligemma_with_expert.paligemma.language_model.layers[layer_idx]
+            self.handles[layer_idx] = layer.mlp.down_proj.register_forward_hook(
+                self._make_hook_fn(layer_idx)
+            )
+    
+    def remove(self):
+        """Remove all registered hooks"""
+        for handle in self.handles.values():
+            handle.remove()
+        self.handles.clear()
+
 
 def generate(prompt, 
              model: PI0Pytorch,
