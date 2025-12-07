@@ -3,7 +3,7 @@ from PIL import Image
 import torch
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
-from openpi.models_pytorch.CAST_helpers import (
+from openpi.models_pytorch.Activation_Engineering_helpers import (
     get_text_and_vision_based_hidden_states,
     extract_hidden_vector,
     compute_behavior_vector,

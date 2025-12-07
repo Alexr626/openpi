@@ -8,7 +8,7 @@ from openpi_client import base_policy as _base_policy
 from openpi_client import msgpack_numpy
 import websockets.asyncio.server as _server
 import websockets.frames
-from constants import CONDITION_PROMPT, POSITIVE_EXAMPLE, NEGATIVE_EXAMPLE, ACTIVATION_ENGINEERING, CAST, ALPHA
+from constants import ACTIVATION_ENGINEERING, CAST
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,10 @@ class WebsocketPolicyServer:
 
         if ACTIVATION_ENGINEERING:
             self._policy.steering_hook.register()
+            logger.info(f"Activation Engineering: Registered steering hook")
+        elif CAST:
+            self._policy.cast_hook.register()
+            logger.info(f"CAST: Registered condition and behavior hooks")
 
         while True:
             try:
@@ -88,6 +92,10 @@ class WebsocketPolicyServer:
                 raise
         if ACTIVATION_ENGINEERING:
             self._policy.steering_hook.remove()
+            logger.info("Activation Engineering: Removed steering hook")
+        elif CAST:
+            self._policy.cast_hook.remove()
+            logger.info("CAST: Removed condition and behavior hooks")
 
 
 def _health_check(connection: _server.ServerConnection, request: _server.Request) -> _server.Response | None:

@@ -18,7 +18,7 @@ from pathlib import Path
 from datetime import datetime
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
-from openpi.models_pytorch.CAST_helpers import (
+from openpi.models_pytorch.Activation_Engineering_helpers import (
     get_text_based_hidden_states,
     extract_hidden_vector,
     compute_behavior_vector,
@@ -462,7 +462,7 @@ def example_cast_analysis():
     print("EXAMPLE 3: Understanding CAST Mechanics")
     print("=" * 80)
 
-    from openpi.models_pytorch.CAST_helpers import (
+    from openpi.models_pytorch.Activation_Engineering_helpers import (
         project_onto_condition,
         compute_similarity,
         apply_threshold_function,

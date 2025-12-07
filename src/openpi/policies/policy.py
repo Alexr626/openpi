@@ -18,8 +18,26 @@ from openpi import transforms as _transforms
 from openpi.models import model as _model
 from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
-from openpi.models_pytorch.CAST_helpers import pad_tokens, get_text_based_hidden_states, SteeringHook, MultiLayerSteeringHook
-from constants import CONDITION_PROMPT, POSITIVE_EXAMPLE, NEGATIVE_EXAMPLE, ACTIVATION_ENGINEERING, CAST, LAYER_INDICES, ALPHA
+from openpi.models_pytorch.Activation_Engineering_helpers import pad_tokens, get_text_based_hidden_states, get_text_based_hidden_states_from_vla, SteeringHook, MultiLayerSteeringHook
+from openpi.models_pytorch.CAST_helpers import (
+    CASTMultiLayerHook,
+    compute_behavior_vector_cast,
+    compute_condition_vector_cast,
+)
+from constants import (
+    POSITIVE_EXAMPLE,
+    NEGATIVE_EXAMPLE,
+    ACTIVATION_ENGINEERING,
+    USE_GEMMA_BACKBONE,
+    CAST,
+    LAYER_INDICES,
+    ALPHA,
+    CAST_THRESHOLD,
+    CAST_CONDITION_LAYER_IDX,
+    CAST_CONDITION_POSITIVE,
+    CAST_CONDITION_NEGATIVE,
+    CAST_LOG_PATH,
+)
 
 BasePolicy: TypeAlias = _base_policy.BasePolicy
 
@@ -78,18 +96,32 @@ class Policy(BasePolicy):
             # Compute steering vectors for each layer
             steering_vecs = {}
             for layer_idx in LAYER_INDICES:
-                positive_vec = get_text_based_hidden_states(
-                    model=self._model,
-                    text=positive_ex_padded,
-                    layer_idx=layer_idx,
-                    tokenizer=self.tokenizer
-                )
-                negative_vec = get_text_based_hidden_states(
-                    model=self._model,
-                    text=negative_ex_padded,
-                    layer_idx=layer_idx,
-                    tokenizer=self.tokenizer
-                )
+                if USE_GEMMA_BACKBONE:
+                    positive_vec = get_text_based_hidden_states_from_vla(
+                        model=self._model,
+                        text=positive_ex_padded,
+                        layer_idx=layer_idx,
+                        tokenizer=self.tokenizer
+                    )
+                    negative_vec = get_text_based_hidden_states_from_vla(
+                        model=self._model,
+                        text=negative_ex_padded,
+                        layer_idx=layer_idx,
+                        tokenizer=self.tokenizer
+                    )
+                else:
+                    positive_vec = get_text_based_hidden_states(
+                        model=self._model,
+                        text=positive_ex_padded,
+                        layer_idx=layer_idx,
+                        tokenizer=self.tokenizer
+                    )
+                    negative_vec = get_text_based_hidden_states(
+                        model=self._model,
+                        text=negative_ex_padded,
+                        layer_idx=layer_idx,
+                        tokenizer=self.tokenizer
+                    )
                 steering_vecs[layer_idx] = positive_vec - negative_vec
             
             self.steering_hook = MultiLayerSteeringHook(
@@ -97,6 +129,56 @@ class Policy(BasePolicy):
                 steering_vecs=steering_vecs,
                 alpha=ALPHA  # Same alpha for all, or pass a dict for per-layer alphas
             )
+            self.cast_hook = None
+
+        elif CAST:
+            # CAST: Conditional Activation Steering
+            # Uses condition vector to determine when to apply behavior steering
+            self.tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
+
+            positive_ex_padded, negative_ex_padded = pad_tokens(
+                tokenizer=self.tokenizer,
+                prompt_add_raw=POSITIVE_EXAMPLE,
+                prompt_sub_raw=NEGATIVE_EXAMPLE
+            )
+
+            # Compute behavior vectors for each behavior layer using PCA-based extraction
+            behavior_vecs = {}
+            for layer_idx in LAYER_INDICES:
+                behavior_vecs[layer_idx] = compute_behavior_vector_cast(
+                    model=self._model,
+                    positive_prompts=[positive_ex_padded],
+                    negative_prompts=[negative_ex_padded],
+                    layer_idx=layer_idx,
+                    tokenizer=self.tokenizer,
+                    suffix_start_idx=None  # Use all tokens for behavior
+                )
+
+            # Compute condition vector at the condition layer
+            condition_vec = compute_condition_vector_cast(
+                model=self._model,
+                positive_prompts=[CAST_CONDITION_POSITIVE],
+                negative_prompts=[CAST_CONDITION_NEGATIVE],
+                layer_idx=CAST_CONDITION_LAYER_IDX,
+                tokenizer=self.tokenizer
+            )
+
+            # Create CAST hook
+            self.cast_hook = CASTMultiLayerHook(
+                model=self._model,
+                behavior_vecs=behavior_vecs,
+                condition_vec=condition_vec,
+                condition_layer_idx=CAST_CONDITION_LAYER_IDX,
+                alpha=ALPHA,
+                threshold=CAST_THRESHOLD,
+                use_tanh=True,
+                log_path=CAST_LOG_PATH
+            )
+            self.steering_hook = None
+
+        else:
+            self.steering_hook = None
+            self.cast_hook = None
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
