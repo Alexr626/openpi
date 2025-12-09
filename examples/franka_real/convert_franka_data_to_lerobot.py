@@ -2,10 +2,14 @@
 Minimal example script for converting a dataset to LeRobot format.
 
 Usage:
-python convert_franka_data_to_lerobot.py --raw_dir /path/to/your/data --repo-id username/dataset_name --task "task description"
+python convert_franka_data_to_lerobot.py --raw_dir /path/to/your/data --repo-id username/dataset_name
 
 If you want to push your dataset to the Hugging Face Hub:
-python convert_franka_data_to_lerobot.py --raw_dir /path/to/your/data --repo-id username/dataset_name --task "task description" --push-to-hub --token $HF_ACCESS_TOKEN
+python convert_franka_data_to_lerobot.py --raw_dir /path/to/your/data --repo-id username/dataset_name --push-to-hub --token $HF_ACCESS_TOKEN
+
+Camera mapping (configurable via --camera1 and --camera2 arguments):
+    Default: robot1_camera1 = wrist camera, robot1_camera2 = front camera
+    Use --camera1 front --camera2 wrist to swap the mapping
 """
 
 import argparse
@@ -88,8 +92,26 @@ def main():
         default=30,
         help="Frames per second for the dataset",
     )
+    parser.add_argument(
+        "--camera1",
+        type=str,
+        choices=["wrist", "front"],
+        default="wrist",
+        help="What robot1_camera1 corresponds to: 'wrist' or 'front' (default: wrist)",
+    )
+    parser.add_argument(
+        "--camera2",
+        type=str,
+        choices=["wrist", "front"],
+        default="front",
+        help="What robot1_camera2 corresponds to: 'wrist' or 'front' (default: front)",
+    )
 
     args = parser.parse_args()
+
+    # Validate camera mapping
+    if args.camera1 == args.camera2:
+        parser.error("--camera1 and --camera2 must be different (one 'wrist', one 'front')")
 
     raw_dir = Path(args.raw_dir)
     repo_id = args.repo_id
@@ -97,6 +119,8 @@ def main():
     push_to_hub = args.push_to_hub
     token = args.token
     fps = args.fps
+    camera1_type = args.camera1
+    camera2_type = args.camera2
 
     # Clean up any existing dataset in the output directory
     if HF_LEROBOT_HOME:
@@ -107,9 +131,10 @@ def main():
     # Create LeRobot dataset, define features to store
     # OpenPi assumes that proprio is stored in `state` and actions in `action`
     # LeRobot assumes that dtype of image data is `image`
-    # robot1_camera1 = front facing camera (image)
-    # robot1_camera2 = wrist camera (wrist_image)
+    # Camera mapping is configurable via --camera1 and --camera2 arguments
     image_shape = (224, 224, 3) if DOWNSAMPLE_IMAGES_FOR_LEROBOT else (256, 256, 3)
+
+    print(f"Camera mapping: robot1_camera1={camera1_type}, robot1_camera2={camera2_type}")
     dataset = LeRobotDataset.create(
         repo_id=repo_id,
         robot_type="panda",
@@ -180,9 +205,7 @@ def main():
         print(f"  Found {num_jpg} frames")
 
         for i in range(num_jpg):
-            # Load images
-            # robot1_camera1 = front facing camera = "image"
-            # robot1_camera2 = wrist camera = "wrist_image"
+            # Load images based on camera mapping
             robot1_camera1_image_path = robot1_camera1_folder / f"{i}.jpg"
             robot1_camera2_image_path = robot1_camera2_folder / f"{i}.jpg"
 
@@ -196,6 +219,14 @@ def main():
             if DOWNSAMPLE_IMAGES_FOR_LEROBOT:
                 robot1_camera1_image = downsample_image(robot1_camera1_image)
                 robot1_camera2_image = downsample_image(robot1_camera2_image)
+
+            # Assign images based on camera mapping
+            if camera1_type == "wrist":
+                wrist_image = robot1_camera1_image
+                front_image = robot1_camera2_image
+            else:
+                wrist_image = robot1_camera2_image
+                front_image = robot1_camera1_image
 
             # Get action from gello (7 joints + 1 gripper = 8 dims)
             current_joint = np.array(gello_joints_json[str(i)][0], dtype=np.float32)
@@ -212,8 +243,8 @@ def main():
 
             dataset.add_frame(
                 {
-                    "image": robot1_camera1_image,  # front facing camera
-                    "wrist_image": robot1_camera2_image,  # wrist camera
+                    "image": front_image,        # front facing camera
+                    "wrist_image": wrist_image,  # wrist camera
                     "state": joint_state,
                     "actions": current_action,
                     "task": task,
