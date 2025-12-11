@@ -1,0 +1,426 @@
+# Multi-Phase CAST Configuration File
+#
+# Each configuration defines PHASE_CONDITIONS and PHASE_BEHAVIORS for all 6 phases.
+# Values: 1 = use concept, -1 = use negated concept (NOT), 0 = don't use
+#
+# Condition Concepts: Target, Surface, Holding, Open
+#   - Target: Near/approaching the target object
+#   - Surface: Near/at a surface
+#   - Holding: Currently holding an object
+#   - Open: Gripper is open
+#
+# Behavior Concepts: Ascent, Arc, Fast, Movement, Open
+#   - Ascent: Moving upward
+#   - Arc: Arc-like motion trajectory
+#   - Fast: Fast movement
+#   - Movement: General movement/activity
+#   - Open: Opening gripper
+
+# =============================================================================
+# BASELINE - All zeros (no conditioning or steering)
+# =============================================================================
+baseline:
+  description: "All concepts set to zero - no conditioning or steering applied"
+  conditions:
+    approach:        {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    pregrasp_hover:  {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    transport:       {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    preplace_hover:  {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    release:         {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    retract:         {Target: 0, Surface: 0, Holding: 0, Open: 0}
+  behaviors:
+    approach:        {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    pregrasp_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    transport:       {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    preplace_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    release:         {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    retract:         {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+
+# =============================================================================
+# SINGLE CONDITION CONCEPT CONFIGS
+# Each config tests one condition concept in isolation
+# =============================================================================
+
+# --- Target concept only ---
+cond_target_only:
+  description: "Condition on Target concept only"
+  conditions:
+    approach:        {Target: 1, Surface: 0, Holding: 0, Open: 0}   # approaching target
+    pregrasp_hover:  {Target: 1, Surface: 0, Holding: 0, Open: 0}   # near target
+    transport:       {Target: -1, Surface: 0, Holding: 0, Open: 0}  # NOT near target (moved away)
+    preplace_hover:  {Target: 1, Surface: 0, Holding: 0, Open: 0}   # near destination target
+    release:         {Target: 1, Surface: 0, Holding: 0, Open: 0}   # at target location
+    retract:         {Target: -1, Surface: 0, Holding: 0, Open: 0}  # NOT near target (retracting)
+  behaviors:
+    approach:        {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    pregrasp_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    transport:       {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    preplace_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    release:         {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    retract:         {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+
+# --- Surface concept only ---
+cond_surface_only:
+  description: "Condition on Surface concept only"
+  conditions:
+    approach:        {Target: 0, Surface: 1, Holding: 0, Open: 0}   # approaching surface
+    pregrasp_hover:  {Target: 0, Surface: 1, Holding: 0, Open: 0}   # hovering near surface
+    transport:       {Target: 0, Surface: -1, Holding: 0, Open: 0}  # NOT near surface (lifted)
+    preplace_hover:  {Target: 0, Surface: 1, Holding: 0, Open: 0}   # near destination surface
+    release:         {Target: 0, Surface: 1, Holding: 0, Open: 0}   # at surface
+    retract:         {Target: 0, Surface: -1, Holding: 0, Open: 0}  # NOT near surface (lifted)
+  behaviors:
+    approach:        {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    pregrasp_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    transport:       {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    preplace_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    release:         {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    retract:         {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+
+# --- Holding concept only ---
+cond_holding_only:
+  description: "Condition on Holding concept only"
+  conditions:
+    approach:        {Target: 0, Surface: 0, Holding: -1, Open: 0}  # NOT holding (empty gripper)
+    pregrasp_hover:  {Target: 0, Surface: 0, Holding: -1, Open: 0}  # NOT holding yet
+    transport:       {Target: 0, Surface: 0, Holding: 1, Open: 0}   # holding object
+    preplace_hover:  {Target: 0, Surface: 0, Holding: 1, Open: 0}   # still holding
+    release:         {Target: 0, Surface: 0, Holding: 1, Open: 0}   # about to release (still holding)
+    retract:         {Target: 0, Surface: 0, Holding: -1, Open: 0}  # NOT holding (released)
+  behaviors:
+    approach:        {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    pregrasp_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    transport:       {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    preplace_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    release:         {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    retract:         {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+
+# --- Open (gripper) concept only ---
+cond_open_only:
+  description: "Condition on Open (gripper state) concept only"
+  conditions:
+    approach:        {Target: 0, Surface: 0, Holding: 0, Open: 1}   # gripper open for approach
+    pregrasp_hover:  {Target: 0, Surface: 0, Holding: 0, Open: 1}   # gripper open before grasp
+    transport:       {Target: 0, Surface: 0, Holding: 0, Open: -1}  # gripper NOT open (closed)
+    preplace_hover:  {Target: 0, Surface: 0, Holding: 0, Open: -1}  # gripper closed
+    release:         {Target: 0, Surface: 0, Holding: 0, Open: 1}   # gripper opening
+    retract:         {Target: 0, Surface: 0, Holding: 0, Open: 1}   # gripper open after release
+  behaviors:
+    approach:        {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    pregrasp_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    transport:       {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    preplace_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    release:         {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    retract:         {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+
+  # --- Open (gripper) concept only ---
+cond_open_surface:
+  description: "Condition on Open (gripper state) concept only"
+  conditions:
+    approach:        {Target: 0, Surface: -1, Holding: 0, Open: 1}   # gripper open for approach
+    pregrasp_hover:  {Target: 0, Surface: 1, Holding: 0, Open: 1}   # gripper open before grasp
+    transport:       {Target: 0, Surface: -1, Holding: 0, Open: -1}  # gripper NOT open (closed)
+    preplace_hover:  {Target: 0, Surface: 1, Holding: 0, Open: -1}  # gripper closed
+    release:         {Target: 0, Surface: 1, Holding: 0, Open: 1}   # gripper opening
+    retract:         {Target: 0, Surface: -1, Holding: 0, Open: 1}   # gripper open after release
+  behaviors:
+    approach:        {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    pregrasp_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    transport:       {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    preplace_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    release:         {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    retract:         {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+
+# =============================================================================
+# SINGLE BEHAVIOR CONCEPT CONFIGS
+# Each config tests one behavior concept in isolation
+# =============================================================================
+
+# --- Movement behavior only ---
+behav_movement_only:
+  description: "Steer with Movement concept only"
+  conditions:
+    approach:        {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    pregrasp_hover:  {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    transport:       {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    preplace_hover:  {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    release:         {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    retract:         {Target: 0, Surface: 0, Holding: 0, Open: 0}
+  behaviors:
+    approach:        {Ascent: 0, Arc: 0, Fast: 0, Movement: 1, Open: 0}
+    pregrasp_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: -1, Open: 0}  # slow/careful
+    transport:       {Ascent: 0, Arc: 0, Fast: 0, Movement: 1, Open: 0}
+    preplace_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: -1, Open: 0}  # slow/careful
+    release:         {Ascent: 0, Arc: 0, Fast: 0, Movement: -1, Open: 0}  # minimal movement
+    retract:         {Ascent: 0, Arc: 0, Fast: 0, Movement: 1, Open: 0}
+
+# --- Ascent behavior only ---
+behav_ascent_only:
+  description: "Steer with Ascent concept only"
+  conditions:
+    approach:        {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    pregrasp_hover:  {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    transport:       {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    preplace_hover:  {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    release:         {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    retract:         {Target: 0, Surface: 0, Holding: 0, Open: 0}
+  behaviors:
+    approach:        {Ascent: -1, Arc: 0, Fast: 0, Movement: 0, Open: 0}  # descend
+    pregrasp_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    transport:       {Ascent: 1, Arc: 0, Fast: 0, Movement: 0, Open: 0}   # lift up
+    preplace_hover:  {Ascent: -1, Arc: 0, Fast: 0, Movement: 0, Open: 0}  # descend
+    release:         {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    retract:         {Ascent: 1, Arc: 0, Fast: 0, Movement: 0, Open: 0}   # lift away
+
+# --- Arc behavior only ---
+behav_arc_only:
+  description: "Steer with Arc concept only"
+  conditions:
+    approach:        {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    pregrasp_hover:  {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    transport:       {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    preplace_hover:  {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    release:         {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    retract:         {Target: 0, Surface: 0, Holding: 0, Open: 0}
+  behaviors:
+    approach:        {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    pregrasp_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    transport:       {Ascent: 0, Arc: 1, Fast: 0, Movement: 0, Open: 0}   # arc trajectory
+    preplace_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    release:         {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    retract:         {Ascent: 0, Arc: 1, Fast: 0, Movement: 0, Open: 0}   # arc away
+
+# --- Fast behavior only ---
+behav_fast_only:
+  description: "Steer with Fast concept only"
+  conditions:
+    approach:        {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    pregrasp_hover:  {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    transport:       {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    preplace_hover:  {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    release:         {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    retract:         {Target: 0, Surface: 0, Holding: 0, Open: 0}
+  behaviors:
+    approach:        {Ascent: 0, Arc: 0, Fast: 1, Movement: 0, Open: 0}   # fast approach
+    pregrasp_hover:  {Ascent: 0, Arc: 0, Fast: -1, Movement: 0, Open: 0}  # slow/careful
+    transport:       {Ascent: 0, Arc: 0, Fast: 1, Movement: 0, Open: 0}   # fast transport
+    preplace_hover:  {Ascent: 0, Arc: 0, Fast: -1, Movement: 0, Open: 0}  # slow/careful
+    release:         {Ascent: 0, Arc: 0, Fast: -1, Movement: 0, Open: 0}  # slow release
+    retract:         {Ascent: 0, Arc: 0, Fast: 1, Movement: 0, Open: 0}   # fast retract
+
+# --- Open (gripper) behavior only ---
+behav_open_only:
+  description: "Steer with Open (gripper) concept only"
+  conditions:
+    approach:        {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    pregrasp_hover:  {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    transport:       {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    preplace_hover:  {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    release:         {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    retract:         {Target: 0, Surface: 0, Holding: 0, Open: 0}
+  behaviors:
+    approach:        {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 1}   # open for approach
+    pregrasp_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 1}   # open before grasp
+    transport:       {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: -1}  # closed during transport
+    preplace_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: -1}  # closed
+    release:         {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 1}   # open to release
+    retract:         {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 1}   # open after release
+
+# =============================================================================
+# TWO-CONCEPT CONDITION CONFIGS
+# Combining two condition concepts for more specific phase detection
+# =============================================================================
+
+# --- Target + Holding ---
+cond_target_holding:
+  description: "Condition on Target and Holding concepts"
+  conditions:
+    approach:        {Target: 1, Surface: 0, Holding: -1, Open: 0}  # near target, NOT holding
+    pregrasp_hover:  {Target: 1, Surface: 0, Holding: -1, Open: 0}  # at target, NOT holding
+    transport:       {Target: -1, Surface: 0, Holding: 1, Open: 0}  # NOT at target, holding
+    preplace_hover:  {Target: 1, Surface: 0, Holding: 1, Open: 0}   # at destination, holding
+    release:         {Target: 1, Surface: 0, Holding: 1, Open: 0}   # at target, holding (about to release)
+    retract:         {Target: -1, Surface: 0, Holding: -1, Open: 0} # NOT at target, NOT holding
+  behaviors:
+    approach:        {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    pregrasp_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    transport:       {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    preplace_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    release:         {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    retract:         {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+
+# --- Surface + Holding ---
+cond_surface_holding:
+  description: "Condition on Surface and Holding concepts"
+  conditions:
+    approach:        {Target: 0, Surface: 1, Holding: -1, Open: 0}  # near surface, NOT holding
+    pregrasp_hover:  {Target: 0, Surface: 1, Holding: -1, Open: 0}  # at surface, NOT holding
+    transport:       {Target: 0, Surface: -1, Holding: 1, Open: 0}  # NOT at surface (lifted), holding
+    preplace_hover:  {Target: 0, Surface: 1, Holding: 1, Open: 0}   # at surface, holding
+    release:         {Target: 0, Surface: 1, Holding: 1, Open: 0}   # at surface, holding
+    retract:         {Target: 0, Surface: -1, Holding: -1, Open: 0} # NOT at surface, NOT holding
+  behaviors:
+    approach:        {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    pregrasp_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    transport:       {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    preplace_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    release:         {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    retract:         {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+
+# --- Holding + Open ---
+cond_holding_open:
+  description: "Condition on Holding and Open (gripper state) concepts"
+  conditions:
+    approach:        {Target: 0, Surface: 0, Holding: -1, Open: 1}  # NOT holding, gripper open
+    pregrasp_hover:  {Target: 0, Surface: 0, Holding: -1, Open: 1}  # NOT holding, gripper open
+    transport:       {Target: 0, Surface: 0, Holding: 1, Open: -1}  # holding, gripper closed
+    preplace_hover:  {Target: 0, Surface: 0, Holding: 1, Open: -1}  # holding, gripper closed
+    release:         {Target: 0, Surface: 0, Holding: 1, Open: 1}   # holding but gripper opening
+    retract:         {Target: 0, Surface: 0, Holding: -1, Open: 1}  # NOT holding, gripper open
+  behaviors:
+    approach:        {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    pregrasp_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    transport:       {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    preplace_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    release:         {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    retract:         {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+
+# =============================================================================
+# TWO-CONCEPT BEHAVIOR CONFIGS
+# Combining two behavior concepts for more nuanced steering
+# =============================================================================
+
+# --- Ascent + Movement ---
+behav_ascent_movement:
+  description: "Steer with Ascent and Movement concepts"
+  conditions:
+    approach:        {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    pregrasp_hover:  {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    transport:       {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    preplace_hover:  {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    release:         {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    retract:         {Target: 0, Surface: 0, Holding: 0, Open: 0}
+  behaviors:
+    approach:        {Ascent: -1, Arc: 0, Fast: 0, Movement: 1, Open: 0}  # descend + move
+    pregrasp_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: -1, Open: 0}  # careful
+    transport:       {Ascent: 1, Arc: 0, Fast: 0, Movement: 1, Open: 0}   # lift + move
+    preplace_hover:  {Ascent: -1, Arc: 0, Fast: 0, Movement: -1, Open: 0} # descend + careful
+    release:         {Ascent: 0, Arc: 0, Fast: 0, Movement: -1, Open: 0}  # minimal movement
+    retract:         {Ascent: 1, Arc: 0, Fast: 0, Movement: 1, Open: 0}   # lift + move away
+
+# --- Arc + Fast ---
+behav_arc_fast:
+  description: "Steer with Arc and Fast concepts"
+  conditions:
+    approach:        {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    pregrasp_hover:  {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    transport:       {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    preplace_hover:  {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    release:         {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    retract:         {Target: 0, Surface: 0, Holding: 0, Open: 0}
+  behaviors:
+    approach:        {Ascent: 0, Arc: 0, Fast: 1, Movement: 0, Open: 0}   # fast approach
+    pregrasp_hover:  {Ascent: 0, Arc: 0, Fast: -1, Movement: 0, Open: 0}  # slow
+    transport:       {Ascent: 0, Arc: 1, Fast: 1, Movement: 0, Open: 0}   # fast arc
+    preplace_hover:  {Ascent: 0, Arc: 0, Fast: -1, Movement: 0, Open: 0}  # slow
+    release:         {Ascent: 0, Arc: 0, Fast: -1, Movement: 0, Open: 0}  # slow release
+    retract:         {Ascent: 0, Arc: 1, Fast: 1, Movement: 0, Open: 0}   # fast arc away
+
+# --- Movement + Open ---
+behav_movement_open:
+  description: "Steer with Movement and Open (gripper) concepts"
+  conditions:
+    approach:        {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    pregrasp_hover:  {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    transport:       {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    preplace_hover:  {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    release:         {Target: 0, Surface: 0, Holding: 0, Open: 0}
+    retract:         {Target: 0, Surface: 0, Holding: 0, Open: 0}
+  behaviors:
+    approach:        {Ascent: 0, Arc: 0, Fast: 0, Movement: 1, Open: 1}   # move + open gripper
+    pregrasp_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: -1, Open: 1}  # careful + open
+    transport:       {Ascent: 0, Arc: 0, Fast: 0, Movement: 1, Open: -1}  # move + closed
+    preplace_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: -1, Open: -1} # careful + closed
+    release:         {Ascent: 0, Arc: 0, Fast: 0, Movement: -1, Open: 1}  # careful + open
+    retract:         {Ascent: 0, Arc: 0, Fast: 0, Movement: 1, Open: 1}   # move + open
+
+# =============================================================================
+# COMBINED CONDITION + BEHAVIOR CONFIGS (one of each)
+# Testing specific condition-behavior pairs
+# =============================================================================
+
+# --- Holding condition + Ascent behavior ---
+cond_holding_behav_ascent:
+  description: "Detect via Holding, steer with Ascent"
+  conditions:
+    approach:        {Target: 0, Surface: 0, Holding: -1, Open: 0}
+    pregrasp_hover:  {Target: 0, Surface: 0, Holding: -1, Open: 0}
+    transport:       {Target: 0, Surface: 0, Holding: 1, Open: 0}
+    preplace_hover:  {Target: 0, Surface: 0, Holding: 1, Open: 0}
+    release:         {Target: 0, Surface: 0, Holding: 1, Open: 0}
+    retract:         {Target: 0, Surface: 0, Holding: -1, Open: 0}
+  behaviors:
+    approach:        {Ascent: -1, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    pregrasp_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    transport:       {Ascent: 1, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    preplace_hover:  {Ascent: -1, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    release:         {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    retract:         {Ascent: 1, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+
+# --- Surface condition + Movement behavior ---
+cond_surface_behav_movement:
+  description: "Detect via Surface, steer with Movement"
+  conditions:
+    approach:        {Target: 0, Surface: 1, Holding: 0, Open: 0}
+    pregrasp_hover:  {Target: 0, Surface: 1, Holding: 0, Open: 0}
+    transport:       {Target: 0, Surface: -1, Holding: 0, Open: 0}
+    preplace_hover:  {Target: 0, Surface: 1, Holding: 0, Open: 0}
+    release:         {Target: 0, Surface: 1, Holding: 0, Open: 0}
+    retract:         {Target: 0, Surface: -1, Holding: 0, Open: 0}
+  behaviors:
+    approach:        {Ascent: 0, Arc: 0, Fast: 0, Movement: 1, Open: 0}
+    pregrasp_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: -1, Open: 0}
+    transport:       {Ascent: 0, Arc: 0, Fast: 0, Movement: 1, Open: 0}
+    preplace_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: -1, Open: 0}
+    release:         {Ascent: 0, Arc: 0, Fast: 0, Movement: -1, Open: 0}
+    retract:         {Ascent: 0, Arc: 0, Fast: 0, Movement: 1, Open: 0}
+
+# --- Target condition + Fast behavior ---
+cond_target_behav_fast:
+  description: "Detect via Target, steer with Fast"
+  conditions:
+    approach:        {Target: 1, Surface: 0, Holding: 0, Open: 0}
+    pregrasp_hover:  {Target: 1, Surface: 0, Holding: 0, Open: 0}
+    transport:       {Target: -1, Surface: 0, Holding: 0, Open: 0}
+    preplace_hover:  {Target: 1, Surface: 0, Holding: 0, Open: 0}
+    release:         {Target: 1, Surface: 0, Holding: 0, Open: 0}
+    retract:         {Target: -1, Surface: 0, Holding: 0, Open: 0}
+  behaviors:
+    approach:        {Ascent: 0, Arc: 0, Fast: 1, Movement: 0, Open: 0}
+    pregrasp_hover:  {Ascent: 0, Arc: 0, Fast: -1, Movement: 0, Open: 0}
+    transport:       {Ascent: 0, Arc: 0, Fast: 1, Movement: 0, Open: 0}
+    preplace_hover:  {Ascent: 0, Arc: 0, Fast: -1, Movement: 0, Open: 0}
+    release:         {Ascent: 0, Arc: 0, Fast: -1, Movement: 0, Open: 0}
+    retract:         {Ascent: 0, Arc: 0, Fast: 1, Movement: 0, Open: 0}
+
+# =============================================================================
+# FULL CONFIGS (multiple concepts - for later experimentation)
+# =============================================================================
+
+# --- Original full config ---
+full_original:
+  description: "Original full configuration with multiple concepts"
+  conditions:
+    approach:        {Target: -1, Surface: 1, Holding: -1, Open: 0}
+    pregrasp_hover:  {Target: 0, Surface: 1, Holding: -1, Open: 0}
+    transport:       {Target: -1, Surface: -1, Holding: 1, Open: -1}
+    preplace_hover:  {Target: 0, Surface: 1, Holding: 1, Open: 0}
+    release:         {Target: 0, Surface: 1, Holding: 1, Open: 1}
+    retract:         {Target: -1, Surface: -1, Holding: -1, Open: 1}
+  behaviors:
+    approach:        {Ascent: 0, Arc: 0, Fast: 0, Movement: 1, Open: 0}
+    pregrasp_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    transport:       {Ascent: 1, Arc: 1, Fast: 0, Movement: 1, Open: 0}
+    preplace_hover:  {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+    release:         {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 1}
+    retract:         {Ascent: 1, Arc: 0, Fast: 1, Movement: 1, Open: 0}

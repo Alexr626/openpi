@@ -23,12 +23,480 @@ from torch import Tensor
 import math
 import json
 import time
+import yaml
 from pathlib import Path
 from typing import Optional, Union, List, Tuple, Dict
 from sklearn.decomposition import PCA
 import numpy as np
 from transformers import AutoTokenizer
 from openpi.models_pytorch.pi0_pytorch import PI0Pytorch, make_att_2d_masks
+
+
+# =============================================================================
+# YAML EXAMPLES LOADING
+# =============================================================================
+
+def load_contrasting_examples(yaml_path: str) -> Dict:
+    """
+    Load contrasting examples from a YAML file.
+
+    Args:
+        yaml_path: Path to the YAML file containing positive/negative examples
+
+    Returns:
+        Dictionary with structure:
+        {
+            'positive_examples': {category: {concept: {'examples': [...], 'category': ...}}},
+            'negative_examples': {category: {concept: {'examples': [...], 'category': ...}}},
+            'metadata': {...}
+        }
+    """
+    yaml_path = Path(yaml_path)
+    if not yaml_path.exists():
+        raise FileNotFoundError(f"Examples file not found: {yaml_path}")
+
+    with open(yaml_path, 'r') as f:
+        data = yaml.safe_load(f)
+
+    return data
+
+
+def get_examples_for_concept(
+    yaml_data: Dict,
+    concept: str,
+    example_type: str = 'xH',
+    max_examples: Optional[int] = None
+) -> Tuple[List[str], List[str]]:
+    """
+    Get positive and negative examples for a specific concept.
+
+    Args:
+        yaml_data: Loaded YAML data
+        concept: Concept name (e.g., 'Holding', 'Target', 'Ascent')
+        example_type: 'robotic_specific' or 'general_physical'
+        max_examples: Maximum number of examples to return (None for all)
+
+    Returns:
+        Tuple of (positive_examples, negative_examples)
+    """
+    positive_examples = yaml_data.get('positive_examples', {})
+    positive_examples = positive_examples.get(example_type, {})
+    positive_examples = positive_examples.get(concept, {})
+    positive_examples = positive_examples.get('examples', [])
+
+    negative_examples = yaml_data.get('negative_examples', {})
+    negative_examples = negative_examples.get(example_type, {})
+    negative_examples = negative_examples.get(concept, {})
+    negative_examples = negative_examples.get('examples', [])
+
+    # Try to get concept-specific negative examples
+    neg_concept_data = yaml_data.get('negative_examples', {}).get(example_type, {}).get(concept, {})
+    if isinstance(neg_concept_data, dict) and 'examples' in neg_concept_data:
+        negative_examples = neg_concept_data['examples']
+
+    if max_examples:
+        positive_examples = positive_examples[:max_examples]
+        negative_examples = negative_examples[:max_examples]
+
+    return positive_examples, negative_examples
+
+
+# =============================================================================
+# MULTI-CONCEPT VECTOR COMPUTATION
+# =============================================================================
+
+def compute_all_concept_vectors(
+    model: PI0Pytorch,
+    yaml_path: str,
+    layer_idx: int,
+    tokenizer: AutoTokenizer,
+    concepts: List[str],
+    example_type: str = 'robotic_specific',
+    max_examples_per_concept: int = 100
+) -> Dict[str, Tensor]:
+    """
+    Compute vectors for all specified concepts from the YAML examples.
+
+    Args:
+        model: PI0Pytorch model
+        yaml_path: Path to YAML file with contrasting examples
+        layer_idx: Layer to extract vectors from
+        tokenizer: Tokenizer
+        concepts: List of concept names to compute vectors for
+        example_type: 'robotic_specific' or 'general_physical'
+        max_examples_per_concept: Max examples to use per concept
+
+    Returns:
+        Dictionary mapping concept name -> vector [hidden_dim]
+    """
+    yaml_data = load_contrasting_examples(yaml_path)
+    concept_vectors = {}
+
+    for concept in concepts:
+        print(f"Computing vector for concept: {concept}")
+        positive_examples, negative_examples = get_examples_for_concept(
+            yaml_data, concept, example_type, max_examples_per_concept
+        )
+
+        if not positive_examples or not negative_examples:
+            print(f"  Warning: No examples found for {concept}, skipping")
+            continue
+
+        # Compute vector using PCA-based extraction
+        vector = compute_behavior_vector_cast(
+            model=model,
+            positive_prompts=positive_examples,
+            negative_prompts=negative_examples,
+            layer_idx=layer_idx,
+            tokenizer=tokenizer,
+            suffix_start_idx=None
+        )
+        concept_vectors[concept] = vector
+        print(f"  Computed vector with shape {vector.shape}")
+
+    return concept_vectors
+
+
+def combine_concept_vectors(
+    concept_vectors: Dict[str, Tensor],
+    combination: Dict[str, int],
+    normalize: bool = False
+) -> Tensor:
+    """
+    Combine multiple concept vectors according to a combination specification.
+
+    Args:
+        concept_vectors: Dictionary mapping concept name -> vector
+        combination: Dictionary mapping concept name -> sign (1, -1, or 0)
+                    1 = add vector, -1 = subtract vector, 0 = don't include
+        normalize: Whether to normalize the combined vector
+
+    Returns:
+        Combined vector [hidden_dim]
+    """
+    combined = None
+    device = None
+    dtype = None
+
+    for concept, sign in combination.items():
+        if sign == 0:
+            continue
+        if concept not in concept_vectors:
+            print(f"Warning: Concept '{concept}' not found in computed vectors, skipping")
+            continue
+
+        vec = concept_vectors[concept]
+        if combined is None:
+            device = vec.device
+            dtype = vec.dtype
+            combined = torch.zeros_like(vec)
+
+        combined = combined + sign * vec
+
+    if combined is None:
+        # All concepts were 0 or missing - return None to indicate no vector
+        return None
+
+    if normalize:
+        norm = torch.norm(combined)
+        if norm > 1e-8:
+            combined = combined / norm
+
+    return combined
+
+
+def compute_phase_vectors(
+    model: PI0Pytorch,
+    yaml_path: str,
+    layer_idx: int,
+    tokenizer: AutoTokenizer,
+    phase_conditions: Dict[str, Dict[str, int]],
+    phase_behaviors: Dict[str, Dict[str, int]],
+    condition_concepts: List[str],
+    behavior_concepts: List[str],
+    enabled_phases: List[str],
+    example_type: str = 'robotic_specific',
+    max_examples: int = 100,
+    normalize_condition_vectors: bool = False,
+    normalize_behavior_vectors: bool = False
+) -> Tuple[Dict[str, Tensor], Dict[str, Tensor]]:
+    """
+    Compute condition and behavior vectors for all enabled phases at the given layer index.
+
+    Args:
+        model: PI0Pytorch model
+        yaml_path: Path to YAML examples
+        layer_idx: Layer for vector extraction
+        tokenizer: Tokenizer
+        phase_conditions: Phase condition combinations from constants
+        phase_behaviors: Phase behavior combinations from constants
+        condition_concepts: List of condition concept names
+        behavior_concepts: List of behavior concept names
+        enabled_phases: List of phase names that are enabled
+        example_type: 'robotic_specific' or 'general_physical'
+        max_examples: Max examples per concept
+
+    Returns:
+        Tuple of (phase_condition_vectors, phase_behavior_vectors)
+        Each is a dict mapping phase_name -> combined vector
+    """
+    # Determine which concepts are actually used (have non-zero values in any enabled phase)
+    used_concepts = set()
+    for phase in enabled_phases:
+        # Check condition concepts
+        if phase in phase_conditions:
+            for concept, sign in phase_conditions[phase].items():
+                if sign != 0 and concept in condition_concepts:
+                    used_concepts.add(concept)
+        # Check behavior concepts
+        if phase in phase_behaviors:
+            for concept, sign in phase_behaviors[phase].items():
+                if sign != 0 and concept in behavior_concepts:
+                    used_concepts.add(concept)
+
+    if not used_concepts:
+        print(f"Warning: No concepts are used across enabled phases, returning empty vectors")
+        return {}, {}
+
+    used_concepts = list(used_concepts)
+    print(f"Computing vectors for {len(used_concepts)} used concepts: {used_concepts}")
+    concept_vectors = compute_all_concept_vectors(
+        model, yaml_path, layer_idx, tokenizer,
+        used_concepts, example_type, max_examples
+    )
+
+    # Compute combined vectors for each enabled phase
+    phase_condition_vecs = {}
+    phase_behavior_vecs = {}
+
+    for phase in enabled_phases:
+        print(f"Combining vectors for phase: {phase}")
+
+        # Condition vector
+        if phase in phase_conditions:
+            cond_combination = phase_conditions[phase]
+            cond_vec = combine_concept_vectors(
+                concept_vectors, cond_combination, normalize=normalize_condition_vectors
+            )
+            if cond_vec is not None:
+                phase_condition_vecs[phase] = cond_vec
+                print(f"  Condition vector computed")
+            else:
+                print(f"  Condition vector skipped (all concepts zero)")
+
+        # Behavior vector
+        if phase in phase_behaviors:
+            behav_combination = phase_behaviors[phase]
+            behav_vec = combine_concept_vectors(
+                concept_vectors, behav_combination, normalize=normalize_behavior_vectors
+            )
+            if behav_vec is not None:
+                phase_behavior_vecs[phase] = behav_vec
+                print(f"  Behavior vector computed")
+            else:
+                print(f"  Behavior vector skipped (all concepts zero)")
+
+    return phase_condition_vecs, phase_behavior_vecs
+
+
+# =============================================================================
+# MULTI-PHASE CAST HOOK
+# =============================================================================
+
+class MultiPhaseCASTHook:
+    """
+    CAST hook for a single layer that supports multiple phases.
+
+    At each timestep, checks similarity against all phase conditions and
+    applies the behavior steering for the phase with highest similarity
+    (if above threshold).
+
+    Create one instance per layer.
+    """
+
+    def __init__(
+        self,
+        model: PI0Pytorch,
+        layer_idx: int,
+        phase_condition_vecs: Dict[str, Tensor],
+        phase_behavior_vecs: Dict[str, Tensor],
+        phase_thresholds: Dict[str, float],
+        phase_alphas: Dict[str, float],
+        use_tanh: bool = True,
+        apply_steering: bool = True,
+        log_path: Optional[str] = None,
+        config_name: Optional[str] = None,
+        config_conditions: Optional[Dict[str, Dict[str, int]]] = None,
+        config_behaviors: Optional[Dict[str, Dict[str, int]]] = None
+    ):
+        """
+        Args:
+            model: PI0Pytorch model
+            layer_idx: The layer index to attach this hook to
+            phase_condition_vecs: Dict mapping phase_name -> condition vector
+            phase_behavior_vecs: Dict mapping phase_name -> behavior vector
+            phase_thresholds: Dict mapping phase_name -> threshold
+            phase_alphas: Dict mapping phase_name -> alpha
+            use_tanh: Apply tanh to projections
+            apply_steering: If True, apply behavior steering when phases detected.
+                           If False, only detect and log phases (useful for tuning).
+            log_path: Optional path to save similarity logs
+            config_name: Name of the phase configuration being used
+            config_conditions: Full phase conditions dict from config
+            config_behaviors: Full phase behaviors dict from config
+        """
+        self.model = model
+        self.layer_idx = layer_idx
+        self.device = model.paligemma_with_expert.paligemma.device
+
+        self.phase_condition_vecs = {
+            name: vec.to(self.device) for name, vec in phase_condition_vecs.items()
+        }
+        self.phase_behavior_vecs = {
+            name: vec.to(self.device) for name, vec in phase_behavior_vecs.items()
+        }
+        self.phases = list(phase_condition_vecs.keys())
+
+        self.phase_thresholds = phase_thresholds
+        self.phase_alphas = phase_alphas
+        self.use_tanh = use_tanh
+        self.apply_steering = apply_steering
+        self.log_path = log_path
+
+        # Config metadata for logging
+        self.config_name = config_name
+        self.config_conditions = config_conditions
+        self.config_behaviors = config_behaviors
+
+        self.handle = None
+
+        # State
+        self.current_phase: Optional[str] = None
+        self.phase_similarities: Dict[str, float] = {}
+        self.timestep = 0
+
+        # Logging
+        self.similarity_history: List[Dict] = []
+
+    def _hook_fn(self, module, input, output):
+        """Check conditions and apply steering in a single hook"""
+        hidden = output[0] if isinstance(output, tuple) else output
+
+        # Compute similarity for each phase
+        self.phase_similarities = {}
+        max_sim = -float('inf')
+        best_phase = None
+
+        for phase in self.phases:
+            cond_vec = self.phase_condition_vecs[phase]
+            threshold = self.phase_thresholds.get(phase, 0.5)
+
+            triggered, similarity = check_condition(
+                hidden, cond_vec, threshold, self.use_tanh
+            )
+            self.phase_similarities[phase] = similarity
+
+            if triggered and similarity > max_sim:
+                max_sim = similarity
+                best_phase = phase
+
+        self.current_phase = best_phase
+
+        # Log
+        log_entry = {
+            'timestep': self.timestep,
+            'layer_idx': self.layer_idx,
+            'phase_similarities': dict(self.phase_similarities),
+            'detected_phase': self.current_phase,
+            'timestamp': time.time()
+        }
+        self.similarity_history.append(log_entry)
+        self.timestep += 1
+
+        # Print status
+        sims_str = ", ".join([f"{p}={s:.4f}" for p, s in self.phase_similarities.items()])
+        if self.current_phase:
+            print(f"MultiPhase CAST [L{self.layer_idx}]: Detected '{self.current_phase}' [{sims_str}]")
+        else:
+            print(f"MultiPhase CAST [L{self.layer_idx}]: No phase detected [{sims_str}]")
+
+        # Apply steering if enabled and a phase was detected
+        if self.current_phase is None:
+            return output
+
+        if not self.apply_steering:
+            return output
+
+        behavior_vec = self.phase_behavior_vecs.get(self.current_phase)
+        if behavior_vec is None:
+            return output
+
+        alpha = self.phase_alphas.get(self.current_phase, 1.0)
+
+        # Apply steering
+        modified = apply_behavior_steering(hidden, behavior_vec, alpha)
+
+        print(f"MultiPhase CAST [L{self.layer_idx}]: Steering '{self.current_phase}' (alpha={alpha})")
+
+        if isinstance(output, tuple):
+            return (modified.to(hidden.dtype),) + output[1:]
+        return modified.to(hidden.dtype)
+
+    def register(self):
+        """Register the hook"""
+        layer = self.model.paligemma_with_expert.paligemma.language_model.layers[self.layer_idx]
+        self.handle = layer.mlp.down_proj.register_forward_hook(self._hook_fn)
+
+        mode = "STEERING ENABLED" if self.apply_steering else "DETECTION ONLY (steering disabled)"
+        print(f"MultiPhase CAST: Registered hook at layer {self.layer_idx} - {mode}")
+        print(f"  Phases: {self.phases}")
+
+    def remove(self):
+        """Remove the hook and save log"""
+        if self.handle:
+            self.handle.remove()
+            self.handle = None
+
+        if self.log_path and self.similarity_history:
+            self.save_similarity_log()
+
+    def save_similarity_log(self, path: Optional[str] = None):
+        """Save similarity history to JSON"""
+        save_path = path or self.log_path
+        if not save_path:
+            return
+
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+
+        log_data = {
+            'metadata': {
+                'config_name': self.config_name,
+                'config_conditions': self.config_conditions,
+                'config_behaviors': self.config_behaviors,
+                'phases': self.phases,
+                'layer_idx': self.layer_idx,
+                'thresholds': self.phase_thresholds,
+                'alphas': self.phase_alphas,
+                'apply_steering': self.apply_steering,
+                'total_timesteps': len(self.similarity_history)
+            },
+            'history': self.similarity_history
+        }
+
+        with open(save_path, 'w') as f:
+            json.dump(log_data, f, indent=2)
+
+        print(f"MultiPhase CAST [L{self.layer_idx}]: Saved log ({len(self.similarity_history)} timesteps) to {save_path}")
+
+    def get_similarity_history(self) -> List[Dict]:
+        """Return similarity history"""
+        return self.similarity_history.copy()
+
+    def clear_history(self):
+        """Clear history and reset timestep"""
+        self.similarity_history.clear()
+        self.timestep = 0
 
 
 # =============================================================================

@@ -60,6 +60,10 @@ class WebsocketPolicyServer:
         elif CAST:
             self._policy.cast_hook.register()
             logger.info(f"CAST: Registered condition and behavior hooks")
+        elif hasattr(self._policy, 'multi_phase_hooks') and self._policy.multi_phase_hooks:
+            for hook in self._policy.multi_phase_hooks:
+                hook.register()
+            logger.info(f"Multi-Phase CAST: Registered {len(self._policy.multi_phase_hooks)} hooks")
 
         while True:
             try:
@@ -96,6 +100,10 @@ class WebsocketPolicyServer:
         elif CAST:
             self._policy.cast_hook.remove()
             logger.info("CAST: Removed condition and behavior hooks")
+        elif hasattr(self._policy, 'multi_phase_hooks') and self._policy.multi_phase_hooks:
+            for hook in self._policy.multi_phase_hooks:
+                hook.remove()
+            logger.info(f"Multi-Phase CAST: Removed {len(self._policy.multi_phase_hooks)} hooks")
 
 
 def _health_check(connection: _server.ServerConnection, request: _server.Request) -> _server.Response | None:
