@@ -8,7 +8,7 @@ from openpi_client import base_policy as _base_policy
 from openpi_client import msgpack_numpy
 import websockets.asyncio.server as _server
 import websockets.frames
-from constants import ACTIVATION_ENGINEERING, CAST
+from constants import ACTIVATION_ENGINEERING, CAST, PHASE_CAST
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +60,7 @@ class WebsocketPolicyServer:
         elif CAST:
             self._policy.cast_hook.register()
             logger.info(f"CAST: Registered condition and behavior hooks")
-        elif hasattr(self._policy, 'multi_phase_hooks') and self._policy.multi_phase_hooks:
+        elif PHASE_CAST:
             for hook in self._policy.multi_phase_hooks:
                 hook.register()
             logger.info(f"Multi-Phase CAST: Registered {len(self._policy.multi_phase_hooks)} hooks")
@@ -100,7 +100,7 @@ class WebsocketPolicyServer:
         elif CAST:
             self._policy.cast_hook.remove()
             logger.info("CAST: Removed condition and behavior hooks")
-        elif hasattr(self._policy, 'multi_phase_hooks') and self._policy.multi_phase_hooks:
+        elif PHASE_CAST:
             for hook in self._policy.multi_phase_hooks:
                 hook.remove()
             logger.info(f"Multi-Phase CAST: Removed {len(self._policy.multi_phase_hooks)} hooks")

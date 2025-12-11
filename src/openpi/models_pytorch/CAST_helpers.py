@@ -957,229 +957,6 @@ def apply_cast_steering(
     return modified, triggered, similarity
 
 
-# =============================================================================
-# HOOK CLASSES FOR INFERENCE
-# =============================================================================
-
-class CASTConditionChecker:
-    """
-    Hook to check condition during first forward pass.
-
-    This captures the hidden state at the condition layer and checks
-    whether the condition is triggered.
-    """
-
-    def __init__(
-        self,
-        model: PI0Pytorch,
-        condition_vec: Tensor,
-        condition_layer_idx: int,
-        threshold: float = 0.5,
-        use_tanh: bool = True
-    ):
-        self.model = model
-        self.device = model.paligemma_with_expert.paligemma.device
-        self.condition_vec = condition_vec.to(self.device)
-        self.condition_layer_idx = condition_layer_idx
-        self.threshold = threshold
-        self.use_tanh = use_tanh
-        self.handle = None
-        self.condition_triggered = False
-        self.similarity_value = 0.0
-        self.checked = False
-
-    def hook_fn(self, module, input, output):
-        """Hook to check condition"""
-        if self.checked:
-            return  # Only check once
-
-        hidden = output[0] if isinstance(output, tuple) else output
-
-        self.condition_triggered, self.similarity_value = check_condition(
-            hidden, self.condition_vec, self.threshold, self.use_tanh
-        )
-        self.checked = True
-
-        status = "TRIGGERED" if self.condition_triggered else "NOT triggered"
-        print(f"CAST Condition Check: {status} (similarity={self.similarity_value:.4f}, threshold={self.threshold})")
-
-    def register(self):
-        """Register hook"""
-        layer = self.model.paligemma_with_expert.paligemma.language_model.layers[self.condition_layer_idx]
-        self.handle = layer.mlp.down_proj.register_forward_hook(self.hook_fn)
-
-    def remove(self):
-        """Remove hook"""
-        if self.handle:
-            self.handle.remove()
-            self.handle = None
-
-    def reset(self):
-        """Reset for new sequence"""
-        self.checked = False
-        self.condition_triggered = False
-        self.similarity_value = 0.0
-
-
-class CASTBehaviorApplier:
-    """
-    Hook to apply behavior steering when condition is triggered.
-
-    This applies the behavior vector at specified layers only when
-    the condition checker has determined the condition is met.
-    """
-
-    def __init__(
-        self,
-        model: PI0Pytorch,
-        behavior_vecs: Dict[int, Tensor],
-        condition_checker: CASTConditionChecker,
-        alpha: Union[float, Dict[int, float]]
-    ):
-        """
-        Args:
-            model: PI0Pytorch model
-            behavior_vecs: Dict mapping layer_idx -> behavior vector
-            condition_checker: CASTConditionChecker instance to query
-            alpha: Scaling factor (single value or per-layer dict)
-        """
-        self.model = model
-        self.device = model.paligemma_with_expert.paligemma.device
-        self.behavior_vecs = {idx: vec.to(self.device) for idx, vec in behavior_vecs.items()}
-        self.condition_checker = condition_checker
-
-        if isinstance(alpha, (int, float)):
-            self.alphas = {idx: float(alpha) for idx in behavior_vecs.keys()}
-        else:
-            self.alphas = alpha
-
-        self.handles: Dict[int, any] = {}
-
-    def _make_hook_fn(self, layer_idx: int):
-        """Create hook function for a specific layer"""
-        behavior_vec = self.behavior_vecs[layer_idx]
-        alpha = self.alphas[layer_idx]
-
-        def hook_fn(module, input, output):
-            # Only apply if condition was triggered
-            if not self.condition_checker.condition_triggered:
-                return output
-
-            hidden = output[0] if isinstance(output, tuple) else output
-
-            # Apply behavior steering
-            modified = apply_behavior_steering(hidden, behavior_vec, alpha)
-
-            print(f"CAST: Applying behavior steering at layer {layer_idx} (alpha={alpha})")
-
-            if isinstance(output, tuple):
-                return (modified.to(hidden.dtype),) + output[1:]
-            return modified.to(hidden.dtype)
-
-        return hook_fn
-
-    def register(self):
-        """Register hooks to all behavior layers"""
-        for layer_idx in self.behavior_vecs.keys():
-            layer = self.model.paligemma_with_expert.paligemma.language_model.layers[layer_idx]
-            self.handles[layer_idx] = layer.mlp.down_proj.register_forward_hook(
-                self._make_hook_fn(layer_idx)
-            )
-
-    def remove(self):
-        """Remove all hooks"""
-        for handle in self.handles.values():
-            handle.remove()
-        self.handles.clear()
-
-
-class CASTSteeringManager:
-    """
-    High-level manager for CAST steering during inference.
-
-    Coordinates condition checking and behavior application across
-    multiple forward passes.
-
-    Usage:
-        manager = CASTSteeringManager(
-            model, behavior_vecs, condition_vec,
-            behavior_layer_indices, condition_layer_idx,
-            alpha, threshold
-        )
-        manager.register()
-
-        # Run inference...
-
-        manager.remove()
-    """
-
-    def __init__(
-        self,
-        model: PI0Pytorch,
-        behavior_vecs: Dict[int, Tensor],
-        condition_vec: Tensor,
-        behavior_layer_indices: List[int],
-        condition_layer_idx: int,
-        alpha: Union[float, Dict[int, float]],
-        threshold: float = 0.5,
-        use_tanh: bool = True
-    ):
-        """
-        Args:
-            model: PI0Pytorch model
-            behavior_vecs: Dict mapping layer_idx -> behavior vector
-            condition_vec: Condition vector [hidden_dim]
-            behavior_layer_indices: Layers where behavior is applied
-            condition_layer_idx: Layer where condition is checked
-            alpha: Scaling factor
-            threshold: Similarity threshold θ
-            use_tanh: Apply tanh to projection
-        """
-        self.model = model
-        self.condition_layer_idx = condition_layer_idx
-
-        # Create condition checker
-        self.condition_checker = CASTConditionChecker(
-            model, condition_vec, condition_layer_idx, threshold, use_tanh
-        )
-
-        # Create behavior applier
-        self.behavior_applier = CASTBehaviorApplier(
-            model, behavior_vecs, self.condition_checker, alpha
-        )
-
-        self._registered = False
-
-    def register(self):
-        """Register all hooks"""
-        if self._registered:
-            return
-        self.condition_checker.register()
-        self.behavior_applier.register()
-        self._registered = True
-
-    def remove(self):
-        """Remove all hooks"""
-        if not self._registered:
-            return
-        self.behavior_applier.remove()
-        self.condition_checker.remove()
-        self._registered = False
-
-    def reset(self):
-        """Reset condition checker for new sequence"""
-        self.condition_checker.reset()
-
-    @property
-    def condition_triggered(self) -> bool:
-        """Whether condition was triggered in last check"""
-        return self.condition_checker.condition_triggered
-
-    @property
-    def similarity_value(self) -> float:
-        """Similarity value from last check"""
-        return self.condition_checker.similarity_value
-
 
 class CASTSingleLayerHook:
     """
@@ -1244,105 +1021,119 @@ class CASTSingleLayerHook:
 
 class CASTMultiLayerHook:
     """
-    Multi-layer CAST that applies condition check at one layer and
-    behavior steering at multiple layers.
+    Multi-layer CAST that applies condition checking and behavior steering
+    at multiple layers. Both condition and behavior vectors are computed
+    per-layer from contrasting examples.
 
-    Similar to CASTSteeringManager but with a simpler interface matching
-    the existing MultiLayerSteeringHook pattern.
+    At each timestep, checks the condition similarity at each layer and
+    applies behavior steering at that layer if the condition is triggered.
     """
 
     def __init__(
         self,
         model: PI0Pytorch,
         behavior_vecs: Dict[int, Tensor],
-        condition_vec: Tensor,
-        condition_layer_idx: int,
+        condition_vecs: Dict[int, Tensor],
         alpha: Union[float, Dict[int, float]],
-        threshold: float = 0.5,
+        threshold: Union[float, Dict[int, float]] = 0.5,
         use_tanh: bool = True,
-        check_every_forward: bool = True,
-        log_path: Optional[str] = None
+        apply_steering: bool = True,
+        log_dir: Optional[str] = None,
+        config_name: Optional[str] = None
     ):
         """
         Args:
             model: PI0Pytorch model
             behavior_vecs: Dict mapping layer_idx -> behavior vector
-            condition_vec: Condition vector [hidden_dim]
-            condition_layer_idx: Layer where condition is checked
-            alpha: Scaling factor (single or per-layer)
-            threshold: Similarity threshold θ
+            condition_vecs: Dict mapping layer_idx -> condition vector
+                           (must have same keys as behavior_vecs)
+            alpha: Scaling factor (single value or per-layer dict)
+            threshold: Similarity threshold θ (single value or per-layer dict)
             use_tanh: Apply tanh to projection
-            check_every_forward: If True, re-evaluate condition on every forward pass
-                                 (for VLA deployment). If False, only check once per
-                                 sequence (for autoregressive text generation).
-            log_path: Optional path to save similarity scores. If provided, scores
-                      are logged at each timestep and saved when remove() is called.
+            apply_steering: If True, apply behavior steering when condition triggered.
+                           If False, only detect and log (useful for tuning thresholds).
+            log_dir: Optional directory to save per-layer similarity logs.
+            config_name: Name of the configuration being used (for logging).
         """
         self.model = model
         self.device = model.paligemma_with_expert.paligemma.device
-        self.behavior_vecs = {idx: vec.to(self.device) for idx, vec in behavior_vecs.items()}
-        self.condition_vec = condition_vec.to(self.device)
-        self.condition_layer_idx = condition_layer_idx
-        self.threshold = threshold
-        self.use_tanh = use_tanh
-        self.check_every_forward = check_every_forward
-        self.log_path = log_path
 
+        # Validate that behavior and condition vecs have same keys
+        if set(behavior_vecs.keys()) != set(condition_vecs.keys()):
+            raise ValueError(
+                f"behavior_vecs and condition_vecs must have same layer indices. "
+                f"Got behavior: {set(behavior_vecs.keys())}, condition: {set(condition_vecs.keys())}"
+            )
+
+        self.layer_indices = sorted(behavior_vecs.keys())
+        self.behavior_vecs = {idx: vec.to(self.device) for idx, vec in behavior_vecs.items()}
+        self.condition_vecs = {idx: vec.to(self.device) for idx, vec in condition_vecs.items()}
+
+        self.use_tanh = use_tanh
+        self.apply_steering = apply_steering
+        self.log_dir = log_dir
+        self.config_name = config_name
+
+        # Handle single value or per-layer alpha
         if isinstance(alpha, (int, float)):
-            self.alphas = {idx: float(alpha) for idx in behavior_vecs.keys()}
+            self.alphas = {idx: float(alpha) for idx in self.layer_indices}
         else:
             self.alphas = alpha
 
-        self.handles: Dict[int, any] = {}
-        self.condition_triggered = False
-        self.similarity_value = 0.0
-        self._condition_checked = False
+        # Handle single value or per-layer threshold
+        if isinstance(threshold, (int, float)):
+            self.thresholds = {idx: float(threshold) for idx in self.layer_indices}
+        else:
+            self.thresholds = threshold
 
-        # Similarity logging
-        self.similarity_history: List[Dict] = []
+        self.handles: Dict[int, any] = {}
+
+        # Per-layer state tracking
+        self.condition_triggered: Dict[int, bool] = {idx: False for idx in self.layer_indices}
+        self.similarity_values: Dict[int, float] = {idx: 0.0 for idx in self.layer_indices}
+
+        # Per-layer similarity logging
+        self.similarity_history: Dict[int, List[Dict]] = {idx: [] for idx in self.layer_indices}
         self.timestep = 0
 
-    def _condition_hook_fn(self, module, input, output):
-        """Hook for condition checking layer"""
-        # For VLA deployment, check condition on every forward pass
-        # For autoregressive generation, only check once per sequence
-        if not self.check_every_forward and self._condition_checked:
-            return
-
-        hidden = output[0] if isinstance(output, tuple) else output
-
-        self.condition_triggered, self.similarity_value = check_condition(
-            hidden, self.condition_vec, self.threshold, self.use_tanh
-        )
-        self._condition_checked = True
-
-        # Log similarity score
-        log_entry = {
-            'timestep': self.timestep,
-            'similarity': self.similarity_value,
-            'triggered': self.condition_triggered,
-            'threshold': self.threshold,
-            'timestamp': time.time()
-        }
-        self.similarity_history.append(log_entry)
-        self.timestep += 1
-
-        status = "TRIGGERED" if self.condition_triggered else "NOT triggered"
-        print(f"CAST Condition: {status} (similarity={self.similarity_value:.4f})")
-
-    def _make_behavior_hook_fn(self, layer_idx: int):
-        """Create behavior hook for a specific layer"""
+    def _make_hook_fn(self, layer_idx: int):
+        """Create combined condition check + steering hook for a specific layer"""
+        condition_vec = self.condition_vecs[layer_idx]
         behavior_vec = self.behavior_vecs[layer_idx]
         alpha = self.alphas[layer_idx]
+        threshold = self.thresholds[layer_idx]
 
         def hook_fn(module, input, output):
-            if not self.condition_triggered:
+            hidden = output[0] if isinstance(output, tuple) else output
+
+            # Check condition at this layer
+            triggered, similarity = check_condition(
+                hidden, condition_vec, threshold, self.use_tanh
+            )
+
+            self.condition_triggered[layer_idx] = triggered
+            self.similarity_values[layer_idx] = similarity
+
+            # Log similarity score
+            log_entry = {
+                'timestep': self.timestep,
+                'layer_idx': layer_idx,
+                'similarity': similarity,
+                'triggered': triggered,
+                'threshold': threshold,
+                'timestamp': time.time()
+            }
+            self.similarity_history[layer_idx].append(log_entry)
+
+            status = "TRIGGERED" if triggered else "not triggered"
+            print(f"CAST [L{layer_idx}]: {status} (sim={similarity:.4f}, θ={threshold})")
+
+            # Apply steering if enabled and condition triggered
+            if not triggered or not self.apply_steering:
                 return output
 
-            hidden = output[0] if isinstance(output, tuple) else output
             modified = apply_behavior_steering(hidden, behavior_vec, alpha)
-
-            print(f"CAST: Steering at layer {layer_idx}")
+            print(f"CAST [L{layer_idx}]: Steering applied (α={alpha})")
 
             if isinstance(output, tuple):
                 return (modified.to(hidden.dtype),) + output[1:]
@@ -1351,74 +1142,114 @@ class CASTMultiLayerHook:
         return hook_fn
 
     def register(self):
-        """Register all hooks"""
-        # Register condition hook
-        cond_layer = self.model.paligemma_with_expert.paligemma.language_model.layers[self.condition_layer_idx]
-        self.handles['condition'] = cond_layer.mlp.down_proj.register_forward_hook(self._condition_hook_fn)
-
-        # Register behavior hooks
-        for layer_idx in self.behavior_vecs.keys():
+        """Register hooks at all layers"""
+        for layer_idx in self.layer_indices:
             layer = self.model.paligemma_with_expert.paligemma.language_model.layers[layer_idx]
             self.handles[layer_idx] = layer.mlp.down_proj.register_forward_hook(
-                self._make_behavior_hook_fn(layer_idx)
+                self._make_hook_fn(layer_idx)
             )
 
+        mode = "STEERING ENABLED" if self.apply_steering else "DETECTION ONLY (steering disabled)"
+        print(f"CAST: Registered hooks at layers {self.layer_indices} - {mode}")
+
     def remove(self):
-        """Remove all hooks and save similarity log if path was provided"""
+        """Remove all hooks and save logs if log_dir was provided"""
         for handle in self.handles.values():
             handle.remove()
         self.handles.clear()
 
-        # Auto-save similarity log when removing hooks
-        if self.log_path and self.similarity_history:
-            self.save_similarity_log()
+        # Auto-save similarity logs when removing hooks
+        if self.log_dir:
+            self.save_similarity_logs()
+
+    def step(self):
+        """Increment timestep counter (call after each forward pass)"""
+        self.timestep += 1
 
     def reset(self):
-        """Reset for new sequence"""
-        self._condition_checked = False
-        self.condition_triggered = False
-        self.similarity_value = 0.0
+        """Reset state for new sequence"""
+        self.condition_triggered = {idx: False for idx in self.layer_indices}
+        self.similarity_values = {idx: 0.0 for idx in self.layer_indices}
 
-    def save_similarity_log(self, path: Optional[str] = None):
+    def save_similarity_logs(self, log_dir: Optional[str] = None):
         """
-        Save similarity history to a JSON file.
+        Save per-layer similarity history to JSON files.
 
         Args:
-            path: Path to save the log. If None, uses self.log_path.
-                  If both are None, does nothing.
+            log_dir: Directory to save logs. If None, uses self.log_dir.
         """
-        save_path = path or self.log_path
-        if not save_path:
-            print("Warning: No log path specified, cannot save similarity log")
+        save_dir = log_dir or self.log_dir
+        if not save_dir:
+            print("Warning: No log directory specified, cannot save similarity logs")
             return
 
-        save_path = Path(save_path)
-        save_path.parent.mkdir(parents=True, exist_ok=True)
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
 
-        log_data = {
-            'metadata': {
-                'threshold': self.threshold,
-                'condition_layer_idx': self.condition_layer_idx,
-                'behavior_layer_indices': list(self.behavior_vecs.keys()),
-                'alpha': self.alphas,
-                'total_timesteps': len(self.similarity_history)
-            },
-            'history': self.similarity_history
-        }
+        for layer_idx in self.layer_indices:
+            history = self.similarity_history[layer_idx]
+            if not history:
+                continue
 
-        with open(save_path, 'w') as f:
-            json.dump(log_data, f, indent=2)
+            log_data = {
+                'metadata': {
+                    'config_name': self.config_name,
+                    'layer_idx': layer_idx,
+                    'threshold': self.thresholds[layer_idx],
+                    'alpha': self.alphas[layer_idx],
+                    'apply_steering': self.apply_steering,
+                    'total_timesteps': len(history)
+                },
+                'history': history
+            }
 
-        print(f"CAST: Saved similarity log ({len(self.similarity_history)} timesteps) to {save_path}")
+            log_path = save_dir / f"cast_similarity_layer{layer_idx}.json"
+            with open(log_path, 'w') as f:
+                json.dump(log_data, f, indent=2)
+
+            print(f"CAST [L{layer_idx}]: Saved log ({len(history)} timesteps) to {log_path}")
 
     def clear_history(self):
-        """Clear the similarity history and reset timestep counter"""
-        self.similarity_history.clear()
+        """Clear all similarity history and reset timestep counter"""
+        for layer_idx in self.layer_indices:
+            self.similarity_history[layer_idx].clear()
         self.timestep = 0
 
-    def get_similarity_history(self) -> List[Dict]:
-        """Return the similarity history"""
-        return self.similarity_history.copy()
+    def get_similarity_history(self, layer_idx: Optional[int] = None) -> Union[Dict[int, List[Dict]], List[Dict]]:
+        """
+        Return similarity history.
+
+        Args:
+            layer_idx: If provided, return history for that layer only.
+                      If None, return dict of all layers.
+        """
+        if layer_idx is not None:
+            return self.similarity_history[layer_idx].copy()
+        return {idx: hist.copy() for idx, hist in self.similarity_history.items()}
+
+    def get_trigger_summary(self) -> Dict[int, Dict]:
+        """Get summary of trigger statistics per layer"""
+        summary = {}
+        for layer_idx in self.layer_indices:
+            history = self.similarity_history[layer_idx]
+            if not history:
+                continue
+
+            triggered_count = sum(1 for entry in history if entry['triggered'])
+            total = len(history)
+            similarities = [entry['similarity'] for entry in history]
+
+            summary[layer_idx] = {
+                'triggered_count': triggered_count,
+                'total_timesteps': total,
+                'trigger_rate': triggered_count / total if total > 0 else 0,
+                'similarity_mean': np.mean(similarities) if similarities else 0,
+                'similarity_std': np.std(similarities) if similarities else 0,
+                'similarity_min': np.min(similarities) if similarities else 0,
+                'similarity_max': np.max(similarities) if similarities else 0,
+            }
+
+        return summary
 
 
 # =============================================================================
@@ -1481,52 +1312,68 @@ def compute_simple_condition_vector(
 
 def setup_cast_steering(
     model: PI0Pytorch,
-    behavior_positive_prompt: str,
-    behavior_negative_prompt: str,
-    condition_trigger_prompt: str,
-    condition_no_trigger_prompt: str,
-    behavior_layer_indices: List[int],
-    condition_layer_idx: int,
+    behavior_positive_prompts: Union[str, List[str]],
+    behavior_negative_prompts: Union[str, List[str]],
+    condition_positive_prompts: Union[str, List[str]],
+    condition_negative_prompts: Union[str, List[str]],
+    layer_indices: List[int],
     tokenizer: AutoTokenizer,
     alpha: float = 1.0,
-    threshold: float = 0.5
+    threshold: float = 0.5,
+    apply_steering: bool = True,
+    log_dir: Optional[str] = None
 ) -> CASTMultiLayerHook:
     """
-    Convenience function to set up CAST steering from simple prompts.
+    Convenience function to set up CAST steering from prompts.
 
     Args:
         model: PI0Pytorch model
-        behavior_positive_prompt: Positive behavior prompt
-        behavior_negative_prompt: Negative behavior prompt
-        condition_trigger_prompt: Prompt where condition should trigger
-        condition_no_trigger_prompt: Prompt where condition should NOT trigger
-        behavior_layer_indices: Layers to apply behavior steering
-        condition_layer_idx: Layer to check condition
+        behavior_positive_prompts: Positive behavior prompt(s) - can be single string or list
+        behavior_negative_prompts: Negative behavior prompt(s) - can be single string or list
+        condition_positive_prompts: Prompt(s) where condition should trigger
+        condition_negative_prompts: Prompt(s) where condition should NOT trigger
+        layer_indices: Layers to apply both condition checking and behavior steering
         tokenizer: Tokenizer
         alpha: Scaling factor
         threshold: Similarity threshold
+        apply_steering: If True, apply steering when condition triggered
+        log_dir: Optional directory for logging
 
     Returns:
         CASTMultiLayerHook ready to be registered
     """
-    # Compute behavior vectors for each layer
+    # Convert single strings to lists
+    if isinstance(behavior_positive_prompts, str):
+        behavior_positive_prompts = [behavior_positive_prompts]
+    if isinstance(behavior_negative_prompts, str):
+        behavior_negative_prompts = [behavior_negative_prompts]
+    if isinstance(condition_positive_prompts, str):
+        condition_positive_prompts = [condition_positive_prompts]
+    if isinstance(condition_negative_prompts, str):
+        condition_negative_prompts = [condition_negative_prompts]
+
+    # Compute behavior and condition vectors for each layer
     behavior_vecs = {}
-    for layer_idx in behavior_layer_indices:
-        behavior_vecs[layer_idx] = compute_simple_behavior_vector(
-            model, behavior_positive_prompt, behavior_negative_prompt,
+    condition_vecs = {}
+    for layer_idx in layer_indices:
+        behavior_vecs[layer_idx] = compute_behavior_vector_cast(
+            model, behavior_positive_prompts, behavior_negative_prompts,
+            layer_idx, tokenizer, suffix_start_idx=None
+        )
+        condition_vecs[layer_idx] = compute_condition_vector_cast(
+            model, condition_positive_prompts, condition_negative_prompts,
             layer_idx, tokenizer
         )
 
-    # Compute condition vector
-    condition_vec = compute_simple_condition_vector(
-        model, condition_trigger_prompt, condition_no_trigger_prompt,
-        condition_layer_idx, tokenizer
-    )
-
     # Create and return hook
     return CASTMultiLayerHook(
-        model, behavior_vecs, condition_vec,
-        condition_layer_idx, alpha, threshold
+        model=model,
+        behavior_vecs=behavior_vecs,
+        condition_vecs=condition_vecs,
+        alpha=alpha,
+        threshold=threshold,
+        apply_steering=apply_steering,
+        log_dir=log_dir
     )
 
 
@@ -1816,14 +1663,14 @@ def summarize_similarity_log(log_path: str) -> Dict:
 if __name__ == '__main__':
     print("CAST Helpers module loaded successfully")
     print("Available classes:")
-    print("  - CASTConditionChecker: Check condition at a single layer")
-    print("  - CASTBehaviorApplier: Apply behavior steering at multiple layers")
-    print("  - CASTSteeringManager: High-level manager coordinating both")
     print("  - CASTSingleLayerHook: Simple single-layer CAST")
-    print("  - CASTMultiLayerHook: Multi-layer CAST with separate condition/behavior layers")
+    print("  - CASTMultiLayerHook: Multi-layer CAST with per-layer condition+behavior vectors")
+    print("  - MultiPhaseCASTHook: Multi-phase CAST for task phase detection")
     print("  - MultiConditionCASTHook: Multiple conditions with OR/AND logic")
     print("")
     print("Convenience functions:")
     print("  - compute_behavior_vector_cast: PCA-based behavior vector extraction")
     print("  - compute_condition_vector_cast: PCA-based condition vector extraction")
-    print("  - setup_cast_steering: Quick setup from simple prompts")
+    print("  - compute_all_concept_vectors: Compute vectors for multiple concepts from YAML")
+    print("  - compute_phase_vectors: Compute phase-specific vectors from YAML config")
+    print("  - setup_cast_steering: Quick setup from prompts")
