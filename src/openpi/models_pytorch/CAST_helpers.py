@@ -300,6 +300,136 @@ def compute_phase_vectors(
 
 
 # =============================================================================
+# LAYER-BASED CAST CONFIG LOADING
+# =============================================================================
+
+def load_layer_cast_config(config_path: str, config_name: str) -> Dict:
+    """
+    Load a layer-based CAST configuration from YAML file.
+
+    Args:
+        config_path: Path to the YAML config file
+        config_name: Name of the configuration to load
+
+    Returns:
+        Dictionary with 'condition' and 'behaviors' keys mapping concept -> coefficient
+    """
+    config_path = Path(config_path)
+    if not config_path.exists():
+        raise FileNotFoundError(f"CAST layer config file not found: {config_path}")
+
+    with open(config_path, 'r') as f:
+        all_configs = yaml.safe_load(f)
+
+    if config_name not in all_configs:
+        available = list(all_configs.keys())
+        raise ValueError(f"Config '{config_name}' not found. Available: {available}")
+
+    config = all_configs[config_name]
+    print(f"Loaded CAST layer config: '{config_name}'")
+
+    return config
+
+
+def compute_layer_cast_vectors(
+    model: PI0Pytorch,
+    yaml_examples_path: str,
+    layer_indices: List[int],
+    tokenizer: AutoTokenizer,
+    condition_combination: Dict[str, int],
+    behavior_combination: Dict[str, int],
+    example_type: str = 'robotic_specific',
+    max_examples: int = 100,
+    normalize_condition: bool = False,
+    normalize_behavior: bool = False
+) -> Tuple[Dict[int, Tensor], Dict[int, Tensor]]:
+    """
+    Compute combined condition and behavior vectors for multiple layers based on
+    concept coefficients from a config.
+
+    Only computes vectors for concepts with non-zero coefficients.
+
+    Args:
+        model: PI0Pytorch model
+        yaml_examples_path: Path to YAML file with contrasting examples
+        layer_indices: List of layer indices to compute vectors for
+        tokenizer: Tokenizer
+        condition_combination: Dict mapping condition concept -> coefficient (-1, 0, 1)
+        behavior_combination: Dict mapping behavior concept -> coefficient (-1, 0, 1)
+        example_type: 'robotic_specific' or 'general_physical'
+        max_examples: Max examples per concept
+        normalize_condition: Whether to normalize combined condition vectors
+        normalize_behavior: Whether to normalize combined behavior vectors
+
+    Returns:
+        Tuple of (condition_vecs, behavior_vecs)
+        Each is a dict mapping layer_idx -> combined vector
+    """
+    # Determine which concepts need vectors computed (non-zero coefficients)
+    used_condition_concepts = [c for c, coef in condition_combination.items() if coef != 0]
+    used_behavior_concepts = [c for c, coef in behavior_combination.items() if coef != 0]
+    all_used_concepts = list(set(used_condition_concepts + used_behavior_concepts))
+
+    if not all_used_concepts:
+        print("Warning: No concepts have non-zero coefficients, returning empty vectors")
+        return {}, {}
+
+    print(f"Computing vectors for {len(all_used_concepts)} concepts: {all_used_concepts}")
+    print(f"  Condition concepts: {used_condition_concepts}")
+    print(f"  Behavior concepts: {used_behavior_concepts}")
+
+    # Compute vectors for each layer
+    condition_vecs = {}
+    behavior_vecs = {}
+
+    for layer_idx in layer_indices:
+        print(f"\nLayer {layer_idx}:")
+
+        # Compute individual concept vectors for this layer
+        concept_vectors = compute_all_concept_vectors(
+            model=model,
+            yaml_path=yaml_examples_path,
+            layer_idx=layer_idx,
+            tokenizer=tokenizer,
+            concepts=all_used_concepts,
+            example_type=example_type,
+            max_examples_per_concept=max_examples
+        )
+
+        # Combine condition vectors
+        if used_condition_concepts:
+            cond_vec = combine_concept_vectors(
+                concept_vectors,
+                condition_combination,
+                normalize=normalize_condition
+            )
+            if cond_vec is not None:
+                condition_vecs[layer_idx] = cond_vec
+                print(f"  Condition vector: combined {len(used_condition_concepts)} concepts")
+            else:
+                print(f"  Condition vector: skipped (all concepts missing or zero)")
+        else:
+            print(f"  Condition vector: skipped (no concepts specified)")
+
+        # Combine behavior vectors
+        if used_behavior_concepts:
+            behav_vec = combine_concept_vectors(
+                concept_vectors,
+                behavior_combination,
+                normalize=normalize_behavior
+            )
+            if behav_vec is not None:
+                behavior_vecs[layer_idx] = behav_vec
+                print(f"  Behavior vector: combined {len(used_behavior_concepts)} concepts")
+            else:
+                print(f"  Behavior vector: skipped (all concepts missing or zero)")
+        else:
+            print(f"  Behavior vector: skipped (no concepts specified)")
+
+    return condition_vecs, behavior_vecs
+
+
+# =============================================================================
 # MULTI-PHASE CAST HOOK
 # =============================================================================
 

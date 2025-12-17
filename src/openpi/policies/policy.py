@@ -26,6 +26,8 @@ from openpi.models_pytorch.CAST_helpers import (
     compute_behavior_vector_cast,
     compute_condition_vector_cast,
     compute_phase_vectors,
+    load_layer_cast_config,
+    compute_layer_cast_vectors,
 )
 from constants import (
     ACTIVATION_ENGINEERING,
@@ -35,11 +37,12 @@ from constants import (
     LAYER_INDICES,
     ALPHA,
     CAST_THRESHOLD,
-    CAST_CONDITION_POSITIVE,
-    CAST_CONDITION_NEGATIVE,
     CAST_LOG_PATH,
-    # Multi-phase CAST constants
+    # Layer-based CAST constants
+    CAST_LAYER_CONFIG_PATH,
+    CAST_LAYER_CONFIG_NAME,
     CAST_EXAMPLES_PATH,
+    # Multi-phase CAST constants
     CAST_PHASE_CONFIG_NAME,
     CONDITION_CONCEPTS,
     BEHAVIOR_CONCEPTS,
@@ -145,75 +148,64 @@ class Policy(BasePolicy):
 
         # elif CAST:
         if CAST:
-            # CAST: Conditional Activation Steering (simplified multi-layer version)
-            # Uses condition vectors to determine when to apply behavior steering
-            # Both condition and behavior vectors are computed per-layer from YAML examples
+            # CAST: Conditional Activation Steering (config-based multi-layer version)
+            # Loads condition and behavior concept coefficients from YAML config
+            # Only computes vectors for concepts with non-zero coefficients
             self.tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
 
-            from openpi.models_pytorch.CAST_helpers import (
-                load_contrasting_examples,
-                get_examples_for_concept,
+            # Load the layer CAST config
+            layer_config = load_layer_cast_config(
+                config_path=str(CAST_LAYER_CONFIG_PATH),
+                config_name=CAST_LAYER_CONFIG_NAME
             )
 
-            # Load examples from YAML file
-            yaml_data = load_contrasting_examples(CAST_EXAMPLES_PATH)
+            condition_combination = layer_config.get('condition', {})
+            behavior_combination = layer_config.get('behaviors', {})
 
-            # Get positive/negative examples for behavior (using a single concept for now)
-            # You can modify this to use different concepts or combinations
-            behavior_positive, behavior_negative = get_examples_for_concept(
-                yaml_data, "Ascent", example_type='robotic_specific', max_examples=100
-            )
+            print(f"CAST config '{CAST_LAYER_CONFIG_NAME}':")
+            print(f"  Condition: {condition_combination}")
+            print(f"  Behavior: {behavior_combination}")
 
-            # Get positive/negative examples for condition
-            condition_positive, condition_negative = get_examples_for_concept(
-                yaml_data, "Target", example_type='robotic_specific', max_examples=100
-            )
-
-            print(f"CAST: Using {len(behavior_positive)} behavior examples and {len(condition_positive)} condition examples")
-
-            # Compute behavior and condition vectors for each layer using PCA-based extraction
-            behavior_vecs = {}
-            condition_vecs = {}
-            for layer_idx in LAYER_INDICES:
-                print(f"Computing vectors for layer {layer_idx}...")
-                behavior_vecs[layer_idx] = compute_behavior_vector_cast(
-                    model=self._model,
-                    positive_prompts=behavior_positive,
-                    negative_prompts=behavior_negative,
-                    layer_idx=layer_idx,
-                    tokenizer=self.tokenizer,
-                    suffix_start_idx=None  # Use all tokens for behavior
-                )
-
-                condition_vecs[layer_idx] = compute_condition_vector_cast(
-                    model=self._model,
-                    positive_prompts=condition_positive,
-                    negative_prompts=condition_negative,
-                    layer_idx=layer_idx,
-                    tokenizer=self.tokenizer
-                )
-
-            # Create timestamped log directory for this run
-            if CAST_LOG_PATH:
-                timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                log_dir = pathlib.Path(CAST_LOG_PATH).parent / timestamp
-                log_dir.mkdir(parents=True, exist_ok=True)
-                print(f"CAST: Logging to {log_dir}")
-            else:
-                log_dir = None
-
-            # Create CAST hook with per-layer condition and behavior vectors
-            self.cast_hook = CASTMultiLayerHook(
+            # Compute combined vectors for each layer based on config
+            condition_vecs, behavior_vecs = compute_layer_cast_vectors(
                 model=self._model,
-                behavior_vecs=behavior_vecs,
-                condition_vecs=condition_vecs,
-                alpha=ALPHA,
-                threshold=CAST_THRESHOLD,
-                use_tanh=True,
-                apply_steering=True,  # Set to False for detection-only mode
-                log_dir=str(log_dir) if log_dir else None,
-                config_name="CAST_multi_layer"
+                yaml_examples_path=CAST_EXAMPLES_PATH,
+                layer_indices=LAYER_INDICES,
+                tokenizer=self.tokenizer,
+                condition_combination=condition_combination,
+                behavior_combination=behavior_combination,
+                example_type='robotic_specific',
+                max_examples=100,
+                normalize_condition=NORMALIZE_CONDITION_VECTORS,
+                normalize_behavior=NORMALIZE_BEHAVIOR_VECTORS
             )
+
+            # Check if we have any vectors to work with
+            if not condition_vecs or not behavior_vecs:
+                print("CAST: No vectors computed (all concepts are zero in config)")
+                self.cast_hook = None
+            else:
+                # Create timestamped log directory for this run under logs/cast/
+                if CAST_LOG_PATH:
+                    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                    log_dir = pathlib.Path("logs") / "cast" / timestamp
+                    log_dir.mkdir(parents=True, exist_ok=True)
+                    print(f"CAST: Logging to {log_dir}")
+                else:
+                    log_dir = None
+
+                # Create CAST hook with per-layer condition and behavior vectors
+                self.cast_hook = CASTMultiLayerHook(
+                    model=self._model,
+                    behavior_vecs=behavior_vecs,
+                    condition_vecs=condition_vecs,
+                    alpha=ALPHA,
+                    threshold=CAST_THRESHOLD,
+                    use_tanh=True,
+                    apply_steering=True,  # Set to False for detection-only mode
+                    log_dir=str(log_dir) if log_dir else None,
+                    config_name=CAST_LAYER_CONFIG_NAME
+                )
 
         elif PHASE_CAST:
             # Determine enabled phases from config: a phase is enabled if ANY concept
@@ -252,10 +244,10 @@ class Policy(BasePolicy):
                         normalize_behavior_vectors=NORMALIZE_BEHAVIOR_VECTORS
                     )
 
-                # Create timestamped log directory for this run
+                # Create timestamped log directory for this run under logs/phase/
                 if CAST_LOG_PATH:
                     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                    log_dir = pathlib.Path(CAST_LOG_PATH).parent / timestamp
+                    log_dir = pathlib.Path("logs") / "phase" / timestamp
                     log_dir.mkdir(parents=True, exist_ok=True)
                     print(f"Multi-Phase CAST: Logging to {log_dir}")
                 else:

@@ -1,0 +1,38 @@
+# Layer-based CAST Configuration File
+#
+# Each configuration defines condition and behavior concept coefficients.
+# Values: 1 = use concept, -1 = use negated concept (NOT), 0 = don't use
+#
+# Only concepts with non-zero coefficients will have vectors computed.
+#
+# Condition Concepts (input-recognizable):
+#   Target, Surface, Holding, Open, Destination, Container, Dropoff, Receptacle, Centered, Payload
+#
+# Behavior Concepts (action-related):
+#   Ascent, Arc, Fast, Movement, Open
+
+# =============================================================================
+# BASELINE - All zeros (no conditioning or steering)
+# =============================================================================
+baseline:
+  condition:  {Target: 0, Surface: 0, Holding: 0, Open: 0, Destination: 0, Container: 0, Dropoff: 0, Receptacle: 0, Centered: 0, Payload: 0}
+  behaviors: {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+
+# =============================================================================
+# EXAMPLE CONFIGS - Add your experimental configs below
+# =============================================================================
+
+# Example: Condition on Target, steer with Ascent
+target_ascent:
+  condition:  {Target: 0, Surface: 0, Holding: 0, Open: 0, Destination: 1, Container: 0, Dropoff: 0, Receptacle: 0, Centered: 0, Payload: 0}
+  behaviors: {Ascent: 1, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+
+# Example: Condition on Holding, steer with Movement
+holding_movement:
+  condition:  {Target: 0, Surface: 0, Holding: 1, Open: 0, Destination: 0, Container: 0, Dropoff: 0, Receptacle: 0, Centered: 0, Payload: 0}
+  behaviors: {Ascent: 0, Arc: 0, Fast: 0, Movement: 1, Open: 0}
+
+# Example: Condition on Holding, steer with Movement
+holding_ascent_and_arc:
+  condition:  {Target: 0, Surface: 0, Holding: 1, Open: 0, Destination: 0, Container: 0, Dropoff: 0, Receptacle: 0, Centered: 0, Payload: 1}
+  behaviors: {Ascent: 1, Arc: 1, Fast: 0, Movement: 0, Open: 0}
