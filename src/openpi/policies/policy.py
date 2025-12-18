@@ -28,6 +28,9 @@ from openpi.models_pytorch.CAST_helpers import (
     compute_phase_vectors,
     load_layer_cast_config,
     compute_layer_cast_vectors,
+    load_and_combine_precomputed_vectors,
+    vectors_exist,
+    VECTORS_DIR,
 )
 from constants import (
     ACTIVATION_ENGINEERING,
@@ -38,12 +41,13 @@ from constants import (
     ALPHA,
     CAST_THRESHOLD,
     CAST_LOG_PATH,
+    DEPLOYMENT_SEED,
     # Layer-based CAST constants
     CAST_LAYER_CONFIG_PATH,
     CAST_LAYER_CONFIG_NAME,
     CAST_EXAMPLES_PATH,
     # Multi-phase CAST constants
-    CAST_PHASE_CONFIG_NAME,
+    PHASE_CONFIG_NAME,
     CONDITION_CONCEPTS,
     BEHAVIOR_CONCEPTS,
     MULTI_PHASE_CAST_APPLY_STEERING,
@@ -91,11 +95,22 @@ class Policy(BasePolicy):
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
+        torch.backends.cudnn.enabled = False
 
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
             self._model.eval()
             self._sample_actions = model.sample_actions
+
+            # Set seeds for reproducibility in flow-matching action expert
+            if DEPLOYMENT_SEED is not None:
+                torch.manual_seed(DEPLOYMENT_SEED)
+                torch.cuda.manual_seed_all(DEPLOYMENT_SEED)
+                np.random.seed(DEPLOYMENT_SEED)
+                # Enable deterministic algorithms where possible
+                torch.backends.cudnn.deterministic = True
+                torch.backends.cudnn.benchmark = False
+                print(f"Deployment seed set to {DEPLOYMENT_SEED} for reproducibility")
         else:
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
@@ -166,22 +181,36 @@ class Policy(BasePolicy):
             print(f"  Condition: {condition_combination}")
             print(f"  Behavior: {behavior_combination}")
 
-            # Compute combined vectors for each layer based on config
-            condition_vecs, behavior_vecs = compute_layer_cast_vectors(
-                model=self._model,
-                yaml_examples_path=CAST_EXAMPLES_PATH,
-                layer_indices=LAYER_INDICES,
-                tokenizer=self.tokenizer,
-                condition_combination=condition_combination,
-                behavior_combination=behavior_combination,
-                example_type='robotic_specific',
-                max_examples=100,
-                normalize_condition=NORMALIZE_CONDITION_VECTORS,
-                normalize_behavior=NORMALIZE_BEHAVIOR_VECTORS
-            )
+            # Try to load pre-computed vectors first, fall back to computing if not available
+            if vectors_exist():
+                print("Loading pre-computed concept vectors from disk...")
+                condition_vecs, behavior_vecs = load_and_combine_precomputed_vectors(
+                    condition_combination=condition_combination,
+                    behavior_combination=behavior_combination,
+                    layer_indices=LAYER_INDICES,
+                    normalize_condition=NORMALIZE_CONDITION_VECTORS,
+                    normalize_behavior=NORMALIZE_BEHAVIOR_VECTORS,
+                    device=self._pytorch_device
+                )
+            else:
+                print("WARNING: Pre-computed vectors not found. Computing vectors from scratch...")
+                print(f"  Run scripts/precompute_vectors.py to pre-compute vectors for reproducibility.")
+                # Compute combined vectors for each layer based on config
+                condition_vecs, behavior_vecs = compute_layer_cast_vectors(
+                    model=self._model,
+                    yaml_examples_path=CAST_EXAMPLES_PATH,
+                    layer_indices=LAYER_INDICES,
+                    tokenizer=self.tokenizer,
+                    condition_combination=condition_combination,
+                    behavior_combination=behavior_combination,
+                    example_type='robotic_specific',
+                    max_examples=100,
+                    normalize_condition=NORMALIZE_CONDITION_VECTORS,
+                    normalize_behavior=NORMALIZE_BEHAVIOR_VECTORS
+                )
 
             # Check if we have any vectors to work with
-            if not condition_vecs or not behavior_vecs:
+            if not condition_vecs and not behavior_vecs:
                 print("CAST: No vectors computed (all concepts are zero in config)")
                 self.cast_hook = None
             else:
@@ -272,7 +301,7 @@ class Policy(BasePolicy):
                         use_tanh=True,
                         apply_steering=MULTI_PHASE_CAST_APPLY_STEERING,
                         log_path=log_path,
-                        config_name=CAST_PHASE_CONFIG_NAME,
+                        config_name=PHASE_CONFIG_NAME,
                         config_conditions=PHASE_CONDITIONS,
                         config_behaviors=PHASE_BEHAVIORS
                     )
