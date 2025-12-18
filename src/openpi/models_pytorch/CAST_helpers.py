@@ -17,6 +17,7 @@ Where:
     - sim(h, g) = h·g / (|h||g|): cosine similarity
 """
 
+import os
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -24,12 +25,17 @@ import math
 import json
 import time
 import yaml
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union, List, Tuple, Dict
 from sklearn.decomposition import PCA
 import numpy as np
 from transformers import AutoTokenizer
 from openpi.models_pytorch.pi0_pytorch import PI0Pytorch, make_att_2d_masks
+
+# Shared file for cross-process coordination of deploy session path
+# This file is written by deploy.py and read by the policy server
+DEPLOY_SESSION_FILE = '/tmp/deploy_session_path.txt'
 
 
 # =============================================================================
@@ -427,6 +433,256 @@ def compute_layer_cast_vectors(
             print(f"  Behavior vector: skipped (no concepts specified)")
 
     return condition_vecs, behavior_vecs
+
+
+# =============================================================================
+# PRE-COMPUTED VECTOR STORAGE
+# =============================================================================
+
+VECTORS_DIR = Path(__file__).parent / "vectors"
+
+
+def precompute_and_save_all_concept_vectors(
+    model: PI0Pytorch,
+    yaml_examples_path: str,
+    layer_indices: List[int],
+    tokenizer: AutoTokenizer,
+    condition_concepts: List[str],
+    behavior_concepts: List[str],
+    example_type: str = 'robotic_specific',
+    num_examples: int = 100,
+    output_dir: Optional[Path] = None
+) -> Path:
+    """
+    Pre-compute vectors for all concepts across all layers and save to disk.
+
+    Saves individual .pt files for each (concept, layer) pair, plus a metadata.json
+    file describing what was computed.
+
+    Args:
+        model: PI0Pytorch model
+        yaml_examples_path: Path to YAML file with contrasting examples
+        layer_indices: List of layer indices to compute vectors for
+        tokenizer: Tokenizer
+        condition_concepts: List of condition concept names
+        behavior_concepts: List of behavior concept names
+        example_type: 'robotic_specific' or 'general_physical'
+        max_examples: Max examples per concept
+        output_dir: Directory to save vectors (defaults to VECTORS_DIR)
+
+    Returns:
+        Path to the output directory
+    """
+    output_dir = VECTORS_DIR / example_type / num_examples
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    all_concepts = list(set(condition_concepts + behavior_concepts))
+    print(f"Pre-computing vectors for {len(all_concepts)} concepts across {len(layer_indices)} layers")
+    print(f"  Condition concepts: {condition_concepts}")
+    print(f"  Behavior concepts: {behavior_concepts}")
+    print(f"  Layers: {layer_indices}")
+    print(f"  Output directory: {output_dir}")
+
+    # Compute and save vectors for each layer
+    for layer_idx in layer_indices:
+        print(f"\nLayer {layer_idx}:")
+
+        # Compute all concept vectors for this layer
+        concept_vectors = compute_all_concept_vectors(
+            model=model,
+            yaml_path=yaml_examples_path,
+            layer_idx=layer_idx,
+            tokenizer=tokenizer,
+            concepts=all_concepts,
+            example_type=example_type,
+            max_examples_per_concept=num_examples
+        )
+
+        # Save each concept vector
+        for concept, vector in concept_vectors.items():
+            filename = f"{concept}_layer{layer_idx}.pt"
+            filepath = output_dir / filename
+            torch.save(vector, filepath)
+            print(f"  Saved {concept} -> {filename}")
+
+    # Save metadata
+    metadata = {
+        'condition_concepts': condition_concepts,
+        'behavior_concepts': behavior_concepts,
+        'all_concepts': all_concepts,
+        'layer_indices': layer_indices,
+        'example_type': example_type,
+        'max_examples': num_examples,
+        'yaml_examples_path': str(yaml_examples_path),
+        'computed_at': datetime.now().isoformat()
+    }
+
+    metadata_path = output_dir / "metadata.json"
+    with open(metadata_path, 'w') as f:
+        json.dump(metadata, f, indent=2)
+
+    print(f"\nSaved metadata to {metadata_path}")
+    print(f"Total vectors saved: {len(all_concepts) * len(layer_indices)}")
+
+    return output_dir
+
+
+def load_precomputed_concept_vectors(
+    concepts: List[str],
+    layer_indices: List[int],
+    vectors_dir: Optional[Path] = None
+) -> Dict[int, Dict[str, Tensor]]:
+    """
+    Load pre-computed concept vectors from disk.
+
+    Args:
+        concepts: List of concept names to load
+        layer_indices: List of layer indices to load vectors for
+        vectors_dir: Directory containing saved vectors (defaults to VECTORS_DIR)
+
+    Returns:
+        Dict mapping layer_idx -> {concept_name -> vector}
+    """
+    vectors_dir = vectors_dir or VECTORS_DIR
+    vectors_dir = Path(vectors_dir)
+
+    if not vectors_dir.exists():
+        raise FileNotFoundError(f"Vectors directory not found: {vectors_dir}")
+
+    result = {}
+    missing = []
+
+    for layer_idx in layer_indices:
+        result[layer_idx] = {}
+
+        for concept in concepts:
+            filename = f"{concept}_layer{layer_idx}.pt"
+            filepath = vectors_dir / filename
+
+            if filepath.exists():
+                result[layer_idx][concept] = torch.load(filepath, weights_only=True)
+            else:
+                missing.append(filename)
+
+    if missing:
+        raise FileNotFoundError(
+            f"Missing pre-computed vectors: {missing}. "
+            f"Run precompute_and_save_all_concept_vectors() first."
+        )
+
+    print(f"Loaded {len(concepts) * len(layer_indices)} pre-computed vectors from {vectors_dir}")
+    return result
+
+
+def load_and_combine_precomputed_vectors(
+    condition_combination: Dict[str, int],
+    behavior_combination: Dict[str, int],
+    layer_indices: List[int],
+    vectors_dir: Optional[Path] = None,
+    normalize_condition: bool = False,
+    normalize_behavior: bool = False,
+    device: Optional[str] = None
+) -> Tuple[Dict[int, Tensor], Dict[int, Tensor]]:
+    """
+    Load pre-computed concept vectors and combine them based on config coefficients.
+
+    This is the main function to use in deployment - it loads pre-computed vectors
+    and combines them according to the config's coefficients.
+
+    Args:
+        condition_combination: Dict mapping condition concept -> coefficient (-1, 0, 1)
+        behavior_combination: Dict mapping behavior concept -> coefficient (-1, 0, 1)
+        layer_indices: List of layer indices
+        vectors_dir: Directory containing saved vectors (defaults to VECTORS_DIR)
+        normalize_condition: Whether to normalize combined condition vectors
+        normalize_behavior: Whether to normalize combined behavior vectors
+        device: Device to move vectors to (optional)
+
+    Returns:
+        Tuple of (condition_vecs, behavior_vecs)
+        Each is a dict mapping layer_idx -> combined vector
+    """
+    # Determine which concepts need to be loaded (non-zero coefficients)
+    used_condition_concepts = [c for c, coef in condition_combination.items() if coef != 0]
+    used_behavior_concepts = [c for c, coef in behavior_combination.items() if coef != 0]
+    all_used_concepts = list(set(used_condition_concepts + used_behavior_concepts))
+
+    if not all_used_concepts:
+        print("Warning: No concepts have non-zero coefficients, returning empty vectors")
+        return {}, {}
+
+    print(f"Loading pre-computed vectors for {len(all_used_concepts)} concepts")
+    print(f"  Condition concepts: {used_condition_concepts}")
+    print(f"  Behavior concepts: {used_behavior_concepts}")
+
+    # Load the needed vectors
+    concept_vectors_by_layer = load_precomputed_concept_vectors(
+        concepts=all_used_concepts,
+        layer_indices=layer_indices,
+        vectors_dir=vectors_dir
+    )
+
+    # Combine vectors for each layer
+    condition_vecs = {}
+    behavior_vecs = {}
+
+    for layer_idx in layer_indices:
+        concept_vectors = concept_vectors_by_layer[layer_idx]
+
+        # Combine condition vectors
+        if used_condition_concepts:
+            cond_vec = combine_concept_vectors(
+                concept_vectors,
+                condition_combination,
+                normalize=normalize_condition
+            )
+            if cond_vec is not None:
+                if device:
+                    cond_vec = cond_vec.to(device)
+                condition_vecs[layer_idx] = cond_vec
+
+        # Combine behavior vectors
+        if used_behavior_concepts:
+            behav_vec = combine_concept_vectors(
+                concept_vectors,
+                behavior_combination,
+                normalize=normalize_behavior
+            )
+            if behav_vec is not None:
+                if device:
+                    behav_vec = behav_vec.to(device)
+                behavior_vecs[layer_idx] = behav_vec
+
+    print(f"Combined vectors for {len(condition_vecs)} layers")
+    return condition_vecs, behavior_vecs
+
+
+def get_vectors_metadata(vectors_dir: Optional[Path] = None) -> Optional[Dict]:
+    """
+    Load metadata about pre-computed vectors.
+
+    Args:
+        vectors_dir: Directory containing saved vectors (defaults to VECTORS_DIR)
+
+    Returns:
+        Metadata dict or None if not found
+    """
+    vectors_dir = vectors_dir or VECTORS_DIR
+    metadata_path = Path(vectors_dir) / "metadata.json"
+
+    if not metadata_path.exists():
+        return None
+
+    with open(metadata_path, 'r') as f:
+        return json.load(f)
+
+
+def vectors_exist(vectors_dir: Optional[Path] = None) -> bool:
+    """Check if pre-computed vectors exist."""
+    vectors_dir = vectors_dir or VECTORS_DIR
+    metadata_path = Path(vectors_dir) / "metadata.json"
+    return metadata_path.exists()
 
 
 # =============================================================================
@@ -1151,20 +1407,23 @@ class CASTSingleLayerHook:
 
 class CASTMultiLayerHook:
     """
-    Multi-layer CAST that applies condition checking and behavior steering
-    at multiple layers. Both condition and behavior vectors are computed
-    per-layer from contrasting examples.
+    Multi-layer CAST that applies condition checking and/or behavior steering
+    at multiple layers. The mode is automatically inferred from which vectors
+    are provided:
 
-    At each timestep, checks the condition similarity at each layer and
-    applies behavior steering at that layer if the condition is triggered.
+    - Both behavior_vecs and condition_vecs provided: Full CAST with conditional steering
+    - Only condition_vecs provided: Condition-only mode (compute/log similarity, no steering)
+    - Only behavior_vecs provided: Steering-only mode (always apply steering unconditionally)
+
+    Both condition and behavior vectors are computed per-layer from contrasting examples.
     """
 
     def __init__(
         self,
         model: PI0Pytorch,
-        behavior_vecs: Dict[int, Tensor],
-        condition_vecs: Dict[int, Tensor],
-        alpha: Union[float, Dict[int, float]],
+        behavior_vecs: Optional[Dict[int, Tensor]] = None,
+        condition_vecs: Optional[Dict[int, Tensor]] = None,
+        alpha: Union[float, Dict[int, float]] = 1.0,
         threshold: Union[float, Dict[int, float]] = 0.5,
         use_tanh: bool = True,
         apply_steering: bool = True,
@@ -1174,30 +1433,54 @@ class CASTMultiLayerHook:
         """
         Args:
             model: PI0Pytorch model
-            behavior_vecs: Dict mapping layer_idx -> behavior vector
-            condition_vecs: Dict mapping layer_idx -> condition vector
-                           (must have same keys as behavior_vecs)
+            behavior_vecs: Dict mapping layer_idx -> behavior vector.
+                          If provided alone, enables steering-only mode.
+                          If provided with condition_vecs, enables full CAST.
+            condition_vecs: Dict mapping layer_idx -> condition vector.
+                           If provided alone, enables condition-only mode.
+                           If provided with behavior_vecs, enables full CAST.
             alpha: Scaling factor (single value or per-layer dict)
             threshold: Similarity threshold θ (single value or per-layer dict)
             use_tanh: Apply tanh to projection
-            apply_steering: If True, apply behavior steering when condition triggered.
+            apply_steering: If True, apply behavior steering when condition triggered (for full CAST mode).
                            If False, only detect and log (useful for tuning thresholds).
+                           Ignored in condition-only mode (never steers) and steering-only mode (always steers).
             log_dir: Optional directory to save per-layer similarity logs.
             config_name: Name of the configuration being used (for logging).
         """
         self.model = model
         self.device = model.paligemma_with_expert.paligemma.device
 
-        # Validate that behavior and condition vecs have same keys
-        if set(behavior_vecs.keys()) != set(condition_vecs.keys()):
-            raise ValueError(
-                f"behavior_vecs and condition_vecs must have same layer indices. "
-                f"Got behavior: {set(behavior_vecs.keys())}, condition: {set(condition_vecs.keys())}"
-            )
+        # Infer mode from which vectors are provided
+        has_behavior = behavior_vecs is not None and len(behavior_vecs) > 0
+        has_condition = condition_vecs is not None and len(condition_vecs) > 0
 
-        self.layer_indices = sorted(behavior_vecs.keys())
-        self.behavior_vecs = {idx: vec.to(self.device) for idx, vec in behavior_vecs.items()}
-        self.condition_vecs = {idx: vec.to(self.device) for idx, vec in condition_vecs.items()}
+        if has_behavior and has_condition:
+            self.mode = 'both'
+            # Validate that both have same layer indices
+            if set(behavior_vecs.keys()) != set(condition_vecs.keys()):
+                raise ValueError(
+                    f"When both behavior_vecs and condition_vecs are provided, they must have same layer indices. "
+                    f"Got behavior: {set(behavior_vecs.keys())}, condition: {set(condition_vecs.keys())}"
+                )
+            self.layer_indices = sorted(behavior_vecs.keys())
+        elif has_condition:
+            self.mode = 'condition_only'
+            self.layer_indices = sorted(condition_vecs.keys())
+        elif has_behavior:
+            self.mode = 'steering_only'
+            self.layer_indices = sorted(behavior_vecs.keys())
+        else:
+            raise ValueError("At least one of behavior_vecs or condition_vecs must be provided")
+
+        # Store vectors (may be empty for some modes)
+        self.behavior_vecs = {}
+        self.condition_vecs = {}
+
+        if has_behavior:
+            self.behavior_vecs = {idx: vec.to(self.device) for idx, vec in behavior_vecs.items()}
+        if has_condition:
+            self.condition_vecs = {idx: vec.to(self.device) for idx, vec in condition_vecs.items()}
 
         self.use_tanh = use_tanh
         self.apply_steering = apply_steering
@@ -1227,47 +1510,67 @@ class CASTMultiLayerHook:
         self.timestep = 0
 
     def _make_hook_fn(self, layer_idx: int):
-        """Create combined condition check + steering hook for a specific layer"""
-        condition_vec = self.condition_vecs[layer_idx]
-        behavior_vec = self.behavior_vecs[layer_idx]
-        alpha = self.alphas[layer_idx]
-        threshold = self.thresholds[layer_idx]
+        """Create hook function for a specific layer based on current mode"""
+        alpha = self.alphas.get(layer_idx, 1.0)
+        threshold = self.thresholds.get(layer_idx, 0.5)
+
+        # Get vectors if available
+        condition_vec = self.condition_vecs.get(layer_idx)
+        behavior_vec = self.behavior_vecs.get(layer_idx)
 
         def hook_fn(module, input, output):
             hidden = output[0] if isinstance(output, tuple) else output
 
-            # Check condition at this layer
-            triggered, similarity = check_condition(
-                hidden, condition_vec, threshold, self.use_tanh
-            )
+            triggered = False
+            similarity = 0.0
 
-            self.condition_triggered[layer_idx] = triggered
-            self.similarity_values[layer_idx] = similarity
+            # Condition checking (for 'both' and 'condition_only' modes)
+            if self.mode in ('both', 'condition_only') and condition_vec is not None:
+                triggered, similarity = check_condition(
+                    hidden, condition_vec, threshold, self.use_tanh
+                )
 
-            # Log similarity score
-            log_entry = {
-                'timestep': self.timestep,
-                'layer_idx': layer_idx,
-                'similarity': similarity,
-                'triggered': triggered,
-                'threshold': threshold,
-                'timestamp': time.time()
-            }
-            self.similarity_history[layer_idx].append(log_entry)
+                self.condition_triggered[layer_idx] = triggered
+                self.similarity_values[layer_idx] = similarity
 
-            status = "TRIGGERED" if triggered else "not triggered"
-            print(f"CAST [L{layer_idx}]: {status} (sim={similarity:.4f}, θ={threshold})")
+                # Log similarity score
+                log_entry = {
+                    'timestep': self.timestep,
+                    'layer_idx': layer_idx,
+                    'similarity': similarity,
+                    'triggered': triggered,
+                    'threshold': threshold,
+                    'timestamp': time.time()
+                }
+                self.similarity_history[layer_idx].append(log_entry)
 
-            # Apply steering if enabled and condition triggered
-            if not triggered or not self.apply_steering:
-                return output
+                status = "TRIGGERED" if triggered else "not triggered"
+                print(f"CAST [L{layer_idx}]: {status} (sim={similarity:.4f}, θ={threshold})")
 
-            modified = apply_behavior_steering(hidden, behavior_vec, alpha)
-            print(f"CAST [L{layer_idx}]: Steering applied (α={alpha})")
+            # Determine if we should apply steering
+            should_steer = False
+            if self.mode == 'steering_only':
+                # Always steer in steering_only mode
+                should_steer = True
+            elif self.mode == 'both':
+                # Steer if condition triggered and apply_steering is enabled
+                should_steer = triggered and self.apply_steering
+            # In 'condition_only' mode, never steer
 
-            if isinstance(output, tuple):
-                return (modified.to(hidden.dtype),) + output[1:]
-            return modified.to(hidden.dtype)
+            # Apply steering if appropriate
+            if should_steer and behavior_vec is not None:
+                modified = apply_behavior_steering(hidden, behavior_vec, alpha)
+
+                if self.mode == 'steering_only':
+                    print(f"CAST [L{layer_idx}]: Steering applied (α={alpha}) [unconditional]")
+                else:
+                    print(f"CAST [L{layer_idx}]: Steering applied (α={alpha})")
+
+                if isinstance(output, tuple):
+                    return (modified.to(hidden.dtype),) + output[1:]
+                return modified.to(hidden.dtype)
+
+            return output
 
         return hook_fn
 
@@ -1279,8 +1582,17 @@ class CASTMultiLayerHook:
                 self._make_hook_fn(layer_idx)
             )
 
-        mode = "STEERING ENABLED" if self.apply_steering else "DETECTION ONLY (steering disabled)"
-        print(f"CAST: Registered hooks at layers {self.layer_indices} - {mode}")
+        # Describe the mode
+        if self.mode == 'condition_only':
+            mode_desc = "CONDITION ONLY (no steering)"
+        elif self.mode == 'steering_only':
+            mode_desc = "STEERING ONLY (unconditional)"
+        elif self.apply_steering:
+            mode_desc = "FULL CAST (condition + steering)"
+        else:
+            mode_desc = "DETECTION ONLY (condition check, steering disabled)"
+
+        print(f"CAST: Registered hooks at layers {self.layer_indices} - {mode_desc}")
 
     def remove(self):
         """Remove all hooks and save logs if log_dir was provided"""
@@ -1301,14 +1613,50 @@ class CASTMultiLayerHook:
         self.condition_triggered = {idx: False for idx in self.layer_indices}
         self.similarity_values = {idx: 0.0 for idx in self.layer_indices}
 
-    def save_similarity_logs(self, log_dir: Optional[str] = None):
+    def save_similarity_logs(self, log_dir: Optional[str] = None, cleanup: bool = True):
         """
         Save per-layer similarity history to JSON files.
 
         Args:
-            log_dir: Directory to save logs. If None, uses self.log_dir.
+            log_dir: Directory to save logs. If None, reads from shared session file,
+                     then falls back to self.log_dir.
+            cleanup: If True, clear similarity history after saving (default: True).
+                     This prevents duplicate saves if called multiple times.
         """
-        save_dir = log_dir or self.log_dir
+        # Priority: explicit arg > shared session file > self.log_dir
+        save_dir = log_dir
+        config_name_override = None  # Config name from deploy.py (if available)
+
+        if not save_dir:
+            # Check for shared session file written by deploy.py (JSON format)
+            if os.path.exists(DEPLOY_SESSION_FILE):
+                try:
+                    with open(DEPLOY_SESSION_FILE, 'r') as f:
+                        session_info = json.load(f)
+                    session_dir = session_info.get('session_dir')
+                    config_name_override = session_info.get('cast_config')
+                    if session_dir:
+                        # Use cast/ subdirectory within the deploy session directory
+                        save_dir = os.path.join(session_dir, 'cast')
+                        print(f"CAST: Using deploy session for logging: {save_dir}")
+                    if config_name_override:
+                        print(f"CAST: Using config name from deploy.py: {config_name_override}")
+                except json.JSONDecodeError:
+                    # Fallback: try reading as plain text (old format)
+                    try:
+                        with open(DEPLOY_SESSION_FILE, 'r') as f:
+                            session_dir = f.read().strip()
+                        if session_dir:
+                            save_dir = os.path.join(session_dir, 'cast')
+                            print(f"CAST: Using deploy session for logging (legacy format): {save_dir}")
+                    except Exception as e:
+                        print(f"CAST: Warning - could not read session file: {e}")
+                except Exception as e:
+                    print(f"CAST: Warning - could not read session file: {e}")
+
+            if not save_dir:
+                save_dir = self.log_dir
+
         if not save_dir:
             print("Warning: No log directory specified, cannot save similarity logs")
             return
@@ -1316,6 +1664,10 @@ class CASTMultiLayerHook:
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
 
+        # Use config name from deploy.py if available, otherwise use self.config_name
+        effective_config_name = config_name_override if config_name_override else self.config_name
+
+        saved_count = 0
         for layer_idx in self.layer_indices:
             history = self.similarity_history[layer_idx]
             if not history:
@@ -1323,7 +1675,7 @@ class CASTMultiLayerHook:
 
             log_data = {
                 'metadata': {
-                    'config_name': self.config_name,
+                    'config_name': effective_config_name,
                     'layer_idx': layer_idx,
                     'threshold': self.thresholds[layer_idx],
                     'alpha': self.alphas[layer_idx],
@@ -1338,6 +1690,12 @@ class CASTMultiLayerHook:
                 json.dump(log_data, f, indent=2)
 
             print(f"CAST [L{layer_idx}]: Saved log ({len(history)} timesteps) to {log_path}")
+            saved_count += 1
+
+        # Cleanup: clear history after saving to prevent duplicate saves
+        if cleanup and saved_count > 0:
+            self.clear_history()
+            print(f"CAST: Cleared similarity history after saving {saved_count} layer logs")
 
     def clear_history(self):
         """Clear all similarity history and reset timestep counter"""
