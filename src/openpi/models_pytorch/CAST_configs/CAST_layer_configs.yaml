@@ -33,6 +33,55 @@ holding_movement:
   behaviors: {Ascent: 0, Arc: 0, Fast: 0, Movement: 1, Open: 0}
 
 # Example: Condition on Holding, steer with Movement
-holding_ascent_and_arc:
+holding_ascent_arc:
+  condition:  {Target: 0, Surface: 0, Holding: 1, Open: 0, Destination: 0, Container: 0, Dropoff: 0, Receptacle: 0, Centered: 0, Payload: 0}
+  behaviors: {Ascent: 1, Arc: 1, Fast: 0, Movement: 0, Open: 0}
+
+# Example: Condition on Holding, steer with Movement
+holding_payload_ascent_arc:
   condition:  {Target: 0, Surface: 0, Holding: 1, Open: 0, Destination: 0, Container: 0, Dropoff: 0, Receptacle: 0, Centered: 0, Payload: 1}
   behaviors: {Ascent: 1, Arc: 1, Fast: 0, Movement: 0, Open: 0}
+
+# =============================================================================
+# SINGLE CONDITION CONCEPT CONFIGS - For isolated testing
+# =============================================================================
+
+target:
+  condition:  {Target: 1, Surface: 0, Holding: 0, Open: 0, Destination: 0, Container: 0, Dropoff: 0, Receptacle: 0, Centered: 0, Payload: 0}
+  behaviors: {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+
+surface:
+  condition:  {Target: 0, Surface: 1, Holding: 0, Open: 0, Destination: 0, Container: 0, Dropoff: 0, Receptacle: 0, Centered: 0, Payload: 0}
+  behaviors: {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+
+holding:
+  condition:  {Target: 0, Surface: 0, Holding: 1, Open: 0, Destination: 0, Container: 0, Dropoff: 0, Receptacle: 0, Centered: 0, Payload: 0}
+  behaviors: {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+
+open:
+  condition:  {Target: 0, Surface: 0, Holding: 0, Open: 1, Destination: 0, Container: 0, Dropoff: 0, Receptacle: 0, Centered: 0, Payload: 0}
+  behaviors: {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+
+destination:
+  condition:  {Target: 0, Surface: 0, Holding: 0, Open: 0, Destination: 1, Container: 0, Dropoff: 0, Receptacle: 0, Centered: 0, Payload: 0}
+  behaviors: {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+
+container:
+  condition:  {Target: 0, Surface: 0, Holding: 0, Open: 0, Destination: 0, Container: 1, Dropoff: 0, Receptacle: 0, Centered: 0, Payload: 0}
+  behaviors: {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+
+dropoff:
+  condition:  {Target: 0, Surface: 0, Holding: 0, Open: 0, Destination: 0, Container: 0, Dropoff: 1, Receptacle: 0, Centered: 0, Payload: 0}
+  behaviors: {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+
+receptacle:
+  condition:  {Target: 0, Surface: 0, Holding: 0, Open: 0, Destination: 0, Container: 0, Dropoff: 0, Receptacle: 1, Centered: 0, Payload: 0}
+  behaviors: {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+
+centered:
+  condition:  {Target: 0, Surface: 0, Holding: 0, Open: 0, Destination: 0, Container: 0, Dropoff: 0, Receptacle: 0, Centered: 1, Payload: 0}
+  behaviors: {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
+
+payload:
+  condition:  {Target: 0, Surface: 0, Holding: 0, Open: 0, Destination: 0, Container: 0, Dropoff: 0, Receptacle: 0, Centered: 0, Payload: 1}
+  behaviors: {Ascent: 0, Arc: 0, Fast: 0, Movement: 0, Open: 0}
