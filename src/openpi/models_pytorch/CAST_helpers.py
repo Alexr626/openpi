@@ -15,23 +15,26 @@ Where:
     - f: thresholding function (outputs 1 if similarity > θ, else 0)
     - proj_c h = (c⊗c / c·c) h: projection of h onto c
     - sim(h, g) = h·g / (|h||g|): cosine similarity
+
+This module contains:
+- Runtime functions for applying CAST during inference (hooks, condition checking, steering)
+- Functions for loading pre-computed vectors from disk
+- YAML/config loading utilities
+
+Vector computation functions are in scripts/precompute_vectors.py
 """
 
 import os
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-import math
 import json
 import time
 import yaml
-from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union, List, Tuple, Dict
-from sklearn.decomposition import PCA
 import numpy as np
-from transformers import AutoTokenizer
-from openpi.models_pytorch.pi0_pytorch import PI0Pytorch, make_att_2d_masks
+from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
 
 # Shared file for cross-process coordination of deploy session path
 # This file is written by deploy.py and read by the policy server
@@ -70,7 +73,7 @@ def load_contrasting_examples(yaml_path: str) -> Dict:
 def get_examples_for_concept(
     yaml_data: Dict,
     concept: str,
-    example_type: str = 'xH',
+    example_type: str = 'general_physical',
     max_examples: Optional[int] = None
 ) -> Tuple[List[str], List[str]]:
     """
@@ -108,64 +111,8 @@ def get_examples_for_concept(
 
 
 # =============================================================================
-# MULTI-CONCEPT VECTOR COMPUTATION
+# VECTOR COMBINATION
 # =============================================================================
-
-def compute_all_concept_vectors(
-    model: PI0Pytorch,
-    yaml_path: str,
-    layer_idx: int,
-    tokenizer: AutoTokenizer,
-    concepts: List[str],
-    example_type: str,
-    max_examples_per_concept: int
-) -> Dict[str, Tensor]:
-    """
-    Compute vectors for all specified concepts from the YAML examples.
-
-    Args:
-        model: PI0Pytorch model
-        yaml_path: Path to YAML file with contrasting examples
-        layer_idx: Layer to extract vectors from
-        tokenizer: Tokenizer
-        concepts: List of concept names to compute vectors for
-        example_type: 'robotic_specific' or 'general_physical'
-        max_examples_per_concept: Max examples to use per concept
-
-    Returns:
-        Dictionary mapping concept name -> vector [hidden_dim]
-    """
-    yaml_data = load_contrasting_examples(yaml_path)
-    concept_vectors = {}
-
-    for concept in concepts:
-        print(f"Computing vector for concept: {concept}")
-        positive_examples, negative_examples = get_examples_for_concept(
-            yaml_data, concept, example_type, max_examples_per_concept
-        )
-
-        if not positive_examples or not negative_examples:
-            print(f"  Warning: No examples found for {concept}, skipping")
-            continue
-
-        # Compute vector using PCA-based extraction
-        vector = compute_behavior_vector_cast(
-            model=model,
-            positive_prompts=positive_examples,
-            negative_prompts=negative_examples,
-            layer_idx=layer_idx,
-            tokenizer=tokenizer,
-            suffix_start_idx=None
-        )
-        concept_vectors[concept] = vector
-        print(f"  Computed vector with shape {vector.shape}")
-
-        # Clear GPU cache after each concept to prevent memory issues with driver 575.x
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-
-    return concept_vectors
-
 
 def combine_concept_vectors(
     concept_vectors: Dict[str, Tensor],
@@ -215,100 +162,6 @@ def combine_concept_vectors(
     return combined
 
 
-def compute_phase_vectors(
-    model: PI0Pytorch,
-    yaml_path: str,
-    layer_idx: int,
-    tokenizer: AutoTokenizer,
-    phase_conditions: Dict[str, Dict[str, int]],
-    phase_behaviors: Dict[str, Dict[str, int]],
-    condition_concepts: List[str],
-    behavior_concepts: List[str],
-    enabled_phases: List[str],
-    example_type: str = 'robotic_specific',
-    max_examples: int = 100,
-    normalize_condition_vectors: bool = False,
-    normalize_behavior_vectors: bool = False
-) -> Tuple[Dict[str, Tensor], Dict[str, Tensor]]:
-    """
-    Compute condition and behavior vectors for all enabled phases at the given layer index.
-
-    Args:
-        model: PI0Pytorch model
-        yaml_path: Path to YAML examples
-        layer_idx: Layer for vector extraction
-        tokenizer: Tokenizer
-        phase_conditions: Phase condition combinations from constants
-        phase_behaviors: Phase behavior combinations from constants
-        condition_concepts: List of condition concept names
-        behavior_concepts: List of behavior concept names
-        enabled_phases: List of phase names that are enabled
-        example_type: 'robotic_specific' or 'general_physical'
-        max_examples: Max examples per concept
-
-    Returns:
-        Tuple of (phase_condition_vectors, phase_behavior_vectors)
-        Each is a dict mapping phase_name -> combined vector
-    """
-    # Determine which concepts are actually used (have non-zero values in any enabled phase)
-    used_concepts = set()
-    for phase in enabled_phases:
-        # Check condition concepts
-        if phase in phase_conditions:
-            for concept, sign in phase_conditions[phase].items():
-                if sign != 0 and concept in condition_concepts:
-                    used_concepts.add(concept)
-        # Check behavior concepts
-        if phase in phase_behaviors:
-            for concept, sign in phase_behaviors[phase].items():
-                if sign != 0 and concept in behavior_concepts:
-                    used_concepts.add(concept)
-
-    if not used_concepts:
-        print(f"Warning: No concepts are used across enabled phases, returning empty vectors")
-        return {}, {}
-
-    used_concepts = list(used_concepts)
-    print(f"Computing vectors for {len(used_concepts)} used concepts: {used_concepts}")
-    concept_vectors = compute_all_concept_vectors(
-        model, yaml_path, layer_idx, tokenizer,
-        used_concepts, example_type, max_examples
-    )
-
-    # Compute combined vectors for each enabled phase
-    phase_condition_vecs = {}
-    phase_behavior_vecs = {}
-
-    for phase in enabled_phases:
-        print(f"Combining vectors for phase: {phase}")
-
-        # Condition vector
-        if phase in phase_conditions:
-            cond_combination = phase_conditions[phase]
-            cond_vec = combine_concept_vectors(
-                concept_vectors, cond_combination, normalize=normalize_condition_vectors
-            )
-            if cond_vec is not None:
-                phase_condition_vecs[phase] = cond_vec
-                print(f"  Condition vector computed")
-            else:
-                print(f"  Condition vector skipped (all concepts zero)")
-
-        # Behavior vector
-        if phase in phase_behaviors:
-            behav_combination = phase_behaviors[phase]
-            behav_vec = combine_concept_vectors(
-                concept_vectors, behav_combination, normalize=normalize_behavior_vectors
-            )
-            if behav_vec is not None:
-                phase_behavior_vecs[phase] = behav_vec
-                print(f"  Behavior vector computed")
-            else:
-                print(f"  Behavior vector skipped (all concepts zero)")
-
-    return phase_condition_vecs, phase_behavior_vecs
-
-
 # =============================================================================
 # LAYER-BASED CAST CONFIG LOADING
 # =============================================================================
@@ -341,197 +194,9 @@ def load_layer_cast_config(config_path: str, config_name: str) -> Dict:
     return config
 
 
-def compute_layer_cast_vectors(
-    model: PI0Pytorch,
-    yaml_examples_path: str,
-    layer_indices: List[int],
-    tokenizer: AutoTokenizer,
-    condition_combination: Dict[str, int],
-    behavior_combination: Dict[str, int],
-    example_type: str = 'robotic_specific',
-    max_examples: int = 100,
-    normalize_condition: bool = False,
-    normalize_behavior: bool = False
-) -> Tuple[Dict[int, Tensor], Dict[int, Tensor]]:
-    """
-    Compute combined condition and behavior vectors for multiple layers based on
-    concept coefficients from a config.
-
-    Only computes vectors for concepts with non-zero coefficients.
-
-    Args:
-        model: PI0Pytorch model
-        yaml_examples_path: Path to YAML file with contrasting examples
-        layer_indices: List of layer indices to compute vectors for
-        tokenizer: Tokenizer
-        condition_combination: Dict mapping condition concept -> coefficient (-1, 0, 1)
-        behavior_combination: Dict mapping behavior concept -> coefficient (-1, 0, 1)
-        example_type: 'robotic_specific' or 'general_physical'
-        max_examples: Max examples per concept
-        normalize_condition: Whether to normalize combined condition vectors
-        normalize_behavior: Whether to normalize combined behavior vectors
-
-    Returns:
-        Tuple of (condition_vecs, behavior_vecs)
-        Each is a dict mapping layer_idx -> combined vector
-    """
-    # Determine which concepts need vectors computed (non-zero coefficients)
-    used_condition_concepts = [c for c, coef in condition_combination.items() if coef != 0]
-    used_behavior_concepts = [c for c, coef in behavior_combination.items() if coef != 0]
-    all_used_concepts = list(set(used_condition_concepts + used_behavior_concepts))
-
-    if not all_used_concepts:
-        print("Warning: No concepts have non-zero coefficients, returning empty vectors")
-        return {}, {}
-
-    print(f"Computing vectors for {len(all_used_concepts)} concepts: {all_used_concepts}")
-    print(f"  Condition concepts: {used_condition_concepts}")
-    print(f"  Behavior concepts: {used_behavior_concepts}")
-
-    # Compute vectors for each layer
-    condition_vecs = {}
-    behavior_vecs = {}
-
-    for layer_idx in layer_indices:
-        print(f"\nLayer {layer_idx}:")
-
-        # Compute individual concept vectors for this layer
-        concept_vectors = compute_all_concept_vectors(
-            model=model,
-            yaml_path=yaml_examples_path,
-            layer_idx=layer_idx,
-            tokenizer=tokenizer,
-            concepts=all_used_concepts,
-            example_type=example_type,
-            max_examples_per_concept=max_examples
-        )
-
-        # Combine condition vectors
-        if used_condition_concepts:
-            cond_vec = combine_concept_vectors(
-                concept_vectors,
-                condition_combination,
-                normalize=normalize_condition
-            )
-            if cond_vec is not None:
-                condition_vecs[layer_idx] = cond_vec
-                print(f"  Condition vector: combined {len(used_condition_concepts)} concepts")
-            else:
-                print(f"  Condition vector: skipped (all concepts missing or zero)")
-        else:
-            print(f"  Condition vector: skipped (no concepts specified)")
-
-        # Combine behavior vectors
-        if used_behavior_concepts:
-            behav_vec = combine_concept_vectors(
-                concept_vectors,
-                behavior_combination,
-                normalize=normalize_behavior
-            )
-            if behav_vec is not None:
-                behavior_vecs[layer_idx] = behav_vec
-                print(f"  Behavior vector: combined {len(used_behavior_concepts)} concepts")
-            else:
-                print(f"  Behavior vector: skipped (all concepts missing or zero)")
-        else:
-            print(f"  Behavior vector: skipped (no concepts specified)")
-
-    return condition_vecs, behavior_vecs
-
-
 # =============================================================================
-# PRE-COMPUTED VECTOR STORAGE
+# PRE-COMPUTED VECTOR LOADING
 # =============================================================================
-
-
-def precompute_and_save_all_concept_vectors(
-    model: PI0Pytorch,
-    yaml_examples_path: str,
-    layer_indices: List[int],
-    tokenizer: AutoTokenizer,
-    condition_concepts: List[str],
-    behavior_concepts: List[str],
-    example_type: str,
-    num_examples: int,
-    output_dir: Path
-) -> Path:
-    """
-    Pre-compute vectors for all concepts across all layers and save to disk.
-
-    Saves individual .pt files for each (concept, layer) pair, plus a metadata.json
-    file describing what was computed.
-
-    Args:
-        model: PI0Pytorch model
-        yaml_examples_path: Path to YAML file with contrasting examples
-        layer_indices: List of layer indices to compute vectors for
-        tokenizer: Tokenizer
-        condition_concepts: List of condition concept names
-        behavior_concepts: List of behavior concept names
-        example_type: 'robotic_specific' or 'general_physical'
-        max_examples: Max examples per concept
-        output_dir: Directory to save vectors
-
-    Returns:
-        Path to the output directory
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    all_concepts = list(set(condition_concepts + behavior_concepts))
-    print(f"Pre-computing vectors for {len(all_concepts)} concepts across {len(layer_indices)} layers")
-    print(f"  Condition concepts: {condition_concepts}")
-    print(f"  Behavior concepts: {behavior_concepts}")
-    print(f"  Layers: {layer_indices}")
-    print(f"  Output directory: {output_dir}")
-
-    # Compute and save vectors for each layer
-    for layer_idx in layer_indices:
-        print(f"\nLayer {layer_idx}:")
-
-        # Compute all concept vectors for this layer
-        concept_vectors = compute_all_concept_vectors(
-            model=model,
-            yaml_path=yaml_examples_path,
-            layer_idx=layer_idx,
-            tokenizer=tokenizer,
-            concepts=all_concepts,
-            example_type=example_type,
-            max_examples_per_concept=num_examples
-        )
-
-        # Save each concept vector
-        for concept, vector in concept_vectors.items():
-            filename = f"{concept}_layer{layer_idx}.pt"
-            filepath = output_dir / filename
-            torch.save(vector, filepath)
-            print(f"  Saved {concept} -> {filename}")
-
-        # Clear GPU cache after each layer to prevent memory issues with driver 575.x
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        print(f"  [GPU cache cleared after layer {layer_idx}]")
-
-    # Save metadata
-    metadata = {
-        'condition_concepts': condition_concepts,
-        'behavior_concepts': behavior_concepts,
-        'all_concepts': all_concepts,
-        'layer_indices': layer_indices,
-        'example_type': example_type,
-        'max_examples': num_examples,
-        'yaml_examples_path': str(yaml_examples_path),
-        'computed_at': datetime.now().isoformat()
-    }
-
-    metadata_path = output_dir / "metadata.json"
-    with open(metadata_path, 'w') as f:
-        json.dump(metadata, f, indent=2)
-
-    print(f"\nSaved metadata to {metadata_path}")
-    print(f"Total vectors saved: {len(all_concepts) * len(layer_indices)}")
-
-    return output_dir
-
 
 def load_precomputed_concept_vectors(
     concepts: List[str],
@@ -572,7 +237,7 @@ def load_precomputed_concept_vectors(
     if missing:
         raise FileNotFoundError(
             f"Missing pre-computed vectors: {missing}. "
-            f"Run precompute_and_save_all_concept_vectors() first."
+            f"Run scripts/precompute_vectors.py first."
         )
 
     print(f"Loaded {len(concepts) * len(layer_indices)} pre-computed vectors from {vectors_dir}")
@@ -688,487 +353,7 @@ def vectors_exist(vectors_dir) -> bool:
 
 
 # =============================================================================
-# MULTI-PHASE CAST HOOK
-# =============================================================================
-
-class MultiPhaseCASTHook:
-    """
-    CAST hook for a single layer that supports multiple phases.
-
-    At each timestep, checks similarity against all phase conditions and
-    applies the behavior steering for the phase with highest similarity
-    (if above threshold).
-
-    Create one instance per layer.
-    """
-
-    def __init__(
-        self,
-        model: PI0Pytorch,
-        layer_idx: int,
-        phase_condition_vecs: Dict[str, Tensor],
-        phase_behavior_vecs: Dict[str, Tensor],
-        phase_thresholds: Dict[str, float],
-        phase_alphas: Dict[str, float],
-        use_tanh: bool = True,
-        apply_steering: bool = True,
-        log_path: Optional[str] = None,
-        config_name: Optional[str] = None,
-        config_conditions: Optional[Dict[str, Dict[str, int]]] = None,
-        config_behaviors: Optional[Dict[str, Dict[str, int]]] = None
-    ):
-        """
-        Args:
-            model: PI0Pytorch model
-            layer_idx: The layer index to attach this hook to
-            phase_condition_vecs: Dict mapping phase_name -> condition vector
-            phase_behavior_vecs: Dict mapping phase_name -> behavior vector
-            phase_thresholds: Dict mapping phase_name -> threshold
-            phase_alphas: Dict mapping phase_name -> alpha
-            use_tanh: Apply tanh to projections
-            apply_steering: If True, apply behavior steering when phases detected.
-                           If False, only detect and log phases (useful for tuning).
-            log_path: Optional path to save similarity logs
-            config_name: Name of the phase configuration being used
-            config_conditions: Full phase conditions dict from config
-            config_behaviors: Full phase behaviors dict from config
-        """
-        self.model = model
-        self.layer_idx = layer_idx
-        self.device = model.paligemma_with_expert.paligemma.device
-
-        self.phase_condition_vecs = {
-            name: vec.to(self.device) for name, vec in phase_condition_vecs.items()
-        }
-        self.phase_behavior_vecs = {
-            name: vec.to(self.device) for name, vec in phase_behavior_vecs.items()
-        }
-        self.phases = list(phase_condition_vecs.keys())
-
-        self.phase_thresholds = phase_thresholds
-        self.phase_alphas = phase_alphas
-        self.use_tanh = use_tanh
-        self.apply_steering = apply_steering
-        self.log_path = log_path
-
-        # Config metadata for logging
-        self.config_name = config_name
-        self.config_conditions = config_conditions
-        self.config_behaviors = config_behaviors
-
-        self.handle = None
-
-        # State
-        self.current_phase: Optional[str] = None
-        self.phase_similarities: Dict[str, float] = {}
-        self.timestep = 0
-
-        # Logging
-        self.similarity_history: List[Dict] = []
-
-    def _hook_fn(self, module, input, output):
-        """Check conditions and apply steering in a single hook"""
-        hidden = output[0] if isinstance(output, tuple) else output
-
-        # Compute similarity for each phase
-        self.phase_similarities = {}
-        max_sim = -float('inf')
-        best_phase = None
-
-        for phase in self.phases:
-            cond_vec = self.phase_condition_vecs[phase]
-            threshold = self.phase_thresholds.get(phase, 0.5)
-
-            triggered, similarity = check_condition(
-                hidden, cond_vec, threshold, self.use_tanh
-            )
-            self.phase_similarities[phase] = similarity
-
-            if triggered and similarity > max_sim:
-                max_sim = similarity
-                best_phase = phase
-
-        self.current_phase = best_phase
-
-        # Log
-        log_entry = {
-            'timestep': self.timestep,
-            'layer_idx': self.layer_idx,
-            'phase_similarities': dict(self.phase_similarities),
-            'detected_phase': self.current_phase,
-            'timestamp': time.time()
-        }
-        self.similarity_history.append(log_entry)
-        self.timestep += 1
-
-        # Print status
-        sims_str = ", ".join([f"{p}={s:.4f}" for p, s in self.phase_similarities.items()])
-        if self.current_phase:
-            print(f"MultiPhase CAST [L{self.layer_idx}]: Detected '{self.current_phase}' [{sims_str}]")
-        else:
-            print(f"MultiPhase CAST [L{self.layer_idx}]: No phase detected [{sims_str}]")
-
-        # Apply steering if enabled and a phase was detected
-        if self.current_phase is None:
-            return output
-
-        if not self.apply_steering:
-            return output
-
-        behavior_vec = self.phase_behavior_vecs.get(self.current_phase)
-        if behavior_vec is None:
-            return output
-
-        alpha = self.phase_alphas.get(self.current_phase, 1.0)
-
-        # Apply steering
-        modified = apply_behavior_steering(hidden, behavior_vec, alpha)
-
-        print(f"MultiPhase CAST [L{self.layer_idx}]: Steering '{self.current_phase}' (alpha={alpha})")
-
-        if isinstance(output, tuple):
-            return (modified.to(hidden.dtype),) + output[1:]
-        return modified.to(hidden.dtype)
-
-    def register(self):
-        """Register the hook"""
-        layer = self.model.paligemma_with_expert.paligemma.language_model.layers[self.layer_idx]
-        self.handle = layer.mlp.down_proj.register_forward_hook(self._hook_fn)
-
-        mode = "STEERING ENABLED" if self.apply_steering else "DETECTION ONLY (steering disabled)"
-        print(f"MultiPhase CAST: Registered hook at layer {self.layer_idx} - {mode}")
-        print(f"  Phases: {self.phases}")
-
-    def remove(self):
-        """Remove the hook and save log"""
-        if self.handle:
-            self.handle.remove()
-            self.handle = None
-
-        if self.log_path and self.similarity_history:
-            self.save_similarity_log()
-
-    def save_similarity_log(self, path: Optional[str] = None):
-        """Save similarity history to JSON"""
-        save_path = path or self.log_path
-        if not save_path:
-            return
-
-        save_path = Path(save_path)
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-
-        log_data = {
-            'metadata': {
-                'config_name': self.config_name,
-                'config_conditions': self.config_conditions,
-                'config_behaviors': self.config_behaviors,
-                'phases': self.phases,
-                'layer_idx': self.layer_idx,
-                'thresholds': self.phase_thresholds,
-                'alphas': self.phase_alphas,
-                'apply_steering': self.apply_steering,
-                'total_timesteps': len(self.similarity_history)
-            },
-            'history': self.similarity_history
-        }
-
-        with open(save_path, 'w') as f:
-            json.dump(log_data, f, indent=2)
-
-        print(f"MultiPhase CAST [L{self.layer_idx}]: Saved log ({len(self.similarity_history)} timesteps) to {save_path}")
-
-    def get_similarity_history(self) -> List[Dict]:
-        """Return similarity history"""
-        return self.similarity_history.copy()
-
-    def clear_history(self):
-        """Clear history and reset timestep"""
-        self.similarity_history.clear()
-        self.timestep = 0
-
-
-# =============================================================================
-# VECTOR EXTRACTION PHASE
-# =============================================================================
-
-def collect_hidden_states_for_cast(
-    model: PI0Pytorch,
-    prompts: List[str],
-    layer_idx: int,
-    tokenizer: AutoTokenizer,
-    average_over_suffix_only: bool = False,
-    suffix_start_idx: Optional[int] = None
-) -> Tensor:
-    """
-    Collect hidden states from multiple prompts at a specific layer.
-
-    Args:
-        model: PI0Pytorch model instance
-        prompts: List of prompt strings
-        layer_idx: Which Gemma decoder layer to extract from
-        tokenizer: Tokenizer for PaliGemma
-        average_over_suffix_only: If True, average only over suffix tokens (for behavior vectors)
-                                  If False, average over all tokens (for condition vectors)
-        suffix_start_idx: If provided, this is the token index where the suffix starts.
-                         Only used when average_over_suffix_only=True
-
-    Returns:
-        Hidden states tensor [num_prompts, hidden_dim] after token averaging
-    """
-    device = model.paligemma_with_expert.paligemma.device
-    all_hidden_states = []
-
-    for i, prompt in enumerate(prompts):
-        # Periodic cache clearing to prevent GPU memory issues with driver 575.x
-        if i > 0 and i % 10 == 0:
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-        # Tokenize
-        inputs = tokenizer(text=prompt, return_tensors="pt").to(device)
-        input_ids = inputs["input_ids"]
-        attention_mask = inputs.get("attention_mask", torch.ones_like(input_ids))
-
-        # Get sequence length for suffix calculation
-        seq_len = input_ids.shape[1]
-
-        # Embed using the VLA's embedding layer
-        token_embeds = model.paligemma_with_expert.embed_language_tokens(input_ids)
-        embed_dim = token_embeds.shape[-1]
-        token_embeds = token_embeds * math.sqrt(embed_dim)
-
-        # Convert to model dtype
-        if model.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
-            token_embeds = token_embeds.to(dtype=torch.bfloat16)
-
-        activations = {}
-
-        def hook(module, input, output):
-            activations['hidden'] = (output[0] if isinstance(output, tuple) else output).detach()
-
-        handle = model.paligemma_with_expert.paligemma.language_model.layers[layer_idx].mlp.down_proj.register_forward_hook(hook)
-
-        try:
-            with torch.no_grad():
-                position_ids = torch.cumsum(attention_mask, dim=1) - 1
-                att_masks = torch.zeros(1, seq_len, dtype=torch.bool, device=device)
-                pad_masks = attention_mask.bool()
-                att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-                att_2d_masks_4d = att_2d_masks[:, None, :, :]
-                att_2d_masks_4d = torch.where(att_2d_masks_4d, 0.0, -2.3819763e38).to(torch.bfloat16)
-
-                _ = model.paligemma_with_expert.paligemma.language_model(
-                    inputs_embeds=token_embeds,
-                    attention_mask=att_2d_masks_4d,
-                    position_ids=position_ids,
-                )
-        finally:
-            handle.remove()
-
-        hidden = activations['hidden']  # [1, seq_len, hidden_dim]
-
-        # Apply token averaging
-        if average_over_suffix_only and suffix_start_idx is not None:
-            # Average only over suffix tokens (for behavior vectors)
-            suffix_hidden = hidden[:, suffix_start_idx:, :]
-            averaged = suffix_hidden.mean(dim=1)  # [1, hidden_dim]
-        else:
-            # Average over all tokens (for condition vectors)
-            averaged = hidden.mean(dim=1)  # [1, hidden_dim]
-
-        all_hidden_states.append(averaged)
-
-    # Stack all prompts: [num_prompts, hidden_dim]
-    return torch.cat(all_hidden_states, dim=0)
-
-
-def extract_vector_with_pca(
-    positive_hidden_states: Tensor,
-    negative_hidden_states: Tensor
-) -> Tensor:
-    """
-    Extract a vector using PCA on mean-centered contrasting examples.
-
-    Following the CAST paper:
-    1. Calculate μ = (H+ + H-) / 2
-    2. Subtract μ from all examples
-    3. Stack examples alternating positive/negative
-    4. Apply PCA and extract first principal component
-
-    Args:
-        positive_hidden_states: Hidden states from positive prompts [n_examples, hidden_dim]
-        negative_hidden_states: Hidden states from negative prompts [n_examples, hidden_dim]
-
-    Returns:
-        First principal component vector [hidden_dim]
-    """
-    device = positive_hidden_states.device
-    dtype = positive_hidden_states.dtype
-
-    # Step 1: Calculate mean (center point between positive and negative)
-    # μ = mean of all examples
-    all_examples = torch.cat([positive_hidden_states, negative_hidden_states], dim=0)
-    mu = all_examples.mean(dim=0, keepdim=True)  # [1, hidden_dim]
-
-    # Step 2: Mean center all examples
-    positive_centered = positive_hidden_states - mu
-    negative_centered = negative_hidden_states - mu
-
-    # Step 3: Stack alternating positive/negative for PCA
-    n_examples = positive_hidden_states.shape[0]
-    stacked = torch.zeros(2 * n_examples, positive_hidden_states.shape[1],
-                          device=device, dtype=dtype)
-    for i in range(n_examples):
-        stacked[2*i] = positive_centered[i]
-        stacked[2*i + 1] = negative_centered[i]
-
-    # Step 4: Apply PCA to extract first principal component
-    # Move to CPU for sklearn PCA, then back to device
-    stacked_np = stacked.float().cpu().numpy()
-    pca = PCA(n_components=1)
-    pca.fit(stacked_np)
-
-    # First principal component
-    principal_component = torch.from_numpy(pca.components_[0]).to(device=device, dtype=dtype)
-
-    # Ensure the direction points from negative to positive
-    # Check by computing mean projections
-    pos_proj = (positive_centered @ principal_component.unsqueeze(-1)).mean()
-    neg_proj = (negative_centered @ principal_component.unsqueeze(-1)).mean()
-
-    if neg_proj > pos_proj:
-        principal_component = -principal_component
-
-    return principal_component
-
-
-def compute_behavior_vector_cast(
-    model: PI0Pytorch,
-    positive_prompts: List[str],
-    negative_prompts: List[str],
-    layer_idx: int,
-    tokenizer: AutoTokenizer,
-    suffix_start_idx: Optional[int] = None
-) -> Tensor:
-    """
-    Compute behavior vector for CAST using PCA on suffix-averaged hidden states.
-
-    For behavior vectors, we average only over suffix tokens (the part of the prompt
-    that specifies the desired behavior).
-
-    Args:
-        model: PI0Pytorch model instance
-        positive_prompts: List of positive example prompts
-        negative_prompts: List of negative example prompts
-        layer_idx: Which layer to extract from
-        tokenizer: Tokenizer
-        suffix_start_idx: Token index where the behavior-relevant suffix starts
-                         If None, uses all tokens
-
-    Returns:
-        Behavior vector [hidden_dim]
-    """
-    # Collect hidden states with suffix averaging
-    positive_hidden = collect_hidden_states_for_cast(
-        model, positive_prompts, layer_idx, tokenizer,
-        average_over_suffix_only=(suffix_start_idx is not None),
-        suffix_start_idx=suffix_start_idx
-    )
-    negative_hidden = collect_hidden_states_for_cast(
-        model, negative_prompts, layer_idx, tokenizer,
-        average_over_suffix_only=(suffix_start_idx is not None),
-        suffix_start_idx=suffix_start_idx
-    )
-
-    # Extract vector using PCA
-    return extract_vector_with_pca(positive_hidden, negative_hidden)
-
-
-def compute_condition_vector_cast(
-    model: PI0Pytorch,
-    positive_prompts: List[str],
-    negative_prompts: List[str],
-    layer_idx: int,
-    tokenizer: AutoTokenizer
-) -> Tensor:
-    """
-    Compute condition vector for CAST using PCA on full-sequence-averaged hidden states.
-
-    For condition vectors, we average over all tokens (to capture the full context
-    that triggers the condition).
-
-    Args:
-        model: PI0Pytorch model instance
-        positive_prompts: List of positive condition prompts (when condition should trigger)
-        negative_prompts: List of negative condition prompts (when condition should NOT trigger)
-        layer_idx: Which layer to extract from
-        tokenizer: Tokenizer
-
-    Returns:
-        Condition vector [hidden_dim]
-    """
-    # Collect hidden states with full token averaging
-    positive_hidden = collect_hidden_states_for_cast(
-        model, positive_prompts, layer_idx, tokenizer,
-        average_over_suffix_only=False
-    )
-    negative_hidden = collect_hidden_states_for_cast(
-        model, negative_prompts, layer_idx, tokenizer,
-        average_over_suffix_only=False
-    )
-
-    # Extract vector using PCA
-    return extract_vector_with_pca(positive_hidden, negative_hidden)
-
-
-def compute_cast_vectors_multi_layer(
-    model: PI0Pytorch,
-    behavior_positive_prompts: List[str],
-    behavior_negative_prompts: List[str],
-    condition_positive_prompts: List[str],
-    condition_negative_prompts: List[str],
-    behavior_layer_indices: List[int],
-    condition_layer_idx: int,
-    tokenizer: AutoTokenizer,
-    behavior_suffix_start_idx: Optional[int] = None
-) -> Tuple[Dict[int, Tensor], Tensor]:
-    """
-    Compute all CAST vectors for multi-layer application.
-
-    Args:
-        model: PI0Pytorch model
-        behavior_positive_prompts: Positive prompts for behavior vector
-        behavior_negative_prompts: Negative prompts for behavior vector
-        condition_positive_prompts: Positive prompts for condition (when to trigger)
-        condition_negative_prompts: Negative prompts for condition (when NOT to trigger)
-        behavior_layer_indices: List of layers to apply behavior steering
-        condition_layer_idx: Layer to check condition
-        tokenizer: Tokenizer
-        behavior_suffix_start_idx: Optional suffix start for behavior extraction
-
-    Returns:
-        Tuple of (behavior_vectors_dict, condition_vector)
-        - behavior_vectors_dict: {layer_idx: behavior_vector}
-        - condition_vector: [hidden_dim]
-    """
-    # Compute behavior vectors for each layer
-    behavior_vectors = {}
-    for layer_idx in behavior_layer_indices:
-        behavior_vectors[layer_idx] = compute_behavior_vector_cast(
-            model, behavior_positive_prompts, behavior_negative_prompts,
-            layer_idx, tokenizer, behavior_suffix_start_idx
-        )
-
-    # Compute single condition vector
-    condition_vector = compute_condition_vector_cast(
-        model, condition_positive_prompts, condition_negative_prompts,
-        condition_layer_idx, tokenizer
-    )
-
-    return behavior_vectors, condition_vector
-
-
-# =============================================================================
-# INFERENCE/APPLICATION PHASE
+# CORE CAST OPERATIONS
 # =============================================================================
 
 def project_onto_condition_vector(
@@ -1348,6 +533,10 @@ def apply_cast_steering(
 
     return modified, triggered, similarity
 
+
+# =============================================================================
+# CAST MULTI-LAYER HOOK
+# =============================================================================
 
 class CASTMultiLayerHook:
     """
@@ -1685,129 +874,203 @@ class CASTMultiLayerHook:
 
 
 # =============================================================================
-# CONVENIENCE FUNCTIONS FOR SIMPLE USAGE
+# MULTI-PHASE CAST HOOK
 # =============================================================================
 
-def compute_simple_behavior_vector(
-    model: PI0Pytorch,
-    positive_prompt: str,
-    negative_prompt: str,
-    layer_idx: int,
-    tokenizer: AutoTokenizer
-) -> Tensor:
+class MultiPhaseCASTHook:
     """
-    Simple behavior vector computation from a single pair of prompts.
+    CAST hook for a single layer that supports multiple phases.
 
-    For more robust vectors, use compute_behavior_vector_cast with multiple prompts.
+    At each timestep, checks similarity against all phase conditions and
+    applies the behavior steering for the phase with highest similarity
+    (if above threshold).
 
-    Args:
-        model: PI0Pytorch model
-        positive_prompt: Positive example prompt
-        negative_prompt: Negative example prompt
-        layer_idx: Layer to extract from
-        tokenizer: Tokenizer
-
-    Returns:
-        Behavior vector [hidden_dim]
+    Create one instance per layer.
     """
-    return compute_behavior_vector_cast(
-        model, [positive_prompt], [negative_prompt],
-        layer_idx, tokenizer, suffix_start_idx=None
-    )
 
+    def __init__(
+        self,
+        model: PI0Pytorch,
+        layer_idx: int,
+        phase_condition_vecs: Dict[str, Tensor],
+        phase_behavior_vecs: Dict[str, Tensor],
+        phase_thresholds: Dict[str, float],
+        phase_alphas: Dict[str, float],
+        use_tanh: bool = True,
+        apply_steering: bool = True,
+        log_path: Optional[str] = None,
+        config_name: Optional[str] = None,
+        config_conditions: Optional[Dict[str, Dict[str, int]]] = None,
+        config_behaviors: Optional[Dict[str, Dict[str, int]]] = None
+    ):
+        """
+        Args:
+            model: PI0Pytorch model
+            layer_idx: The layer index to attach this hook to
+            phase_condition_vecs: Dict mapping phase_name -> condition vector
+            phase_behavior_vecs: Dict mapping phase_name -> behavior vector
+            phase_thresholds: Dict mapping phase_name -> threshold
+            phase_alphas: Dict mapping phase_name -> alpha
+            use_tanh: Apply tanh to projections
+            apply_steering: If True, apply behavior steering when phases detected.
+                           If False, only detect and log phases (useful for tuning).
+            log_path: Optional path to save similarity logs
+            config_name: Name of the phase configuration being used
+            config_conditions: Full phase conditions dict from config
+            config_behaviors: Full phase behaviors dict from config
+        """
+        self.model = model
+        self.layer_idx = layer_idx
+        self.device = model.paligemma_with_expert.paligemma.device
 
-def compute_simple_condition_vector(
-    model: PI0Pytorch,
-    condition_trigger_prompt: str,
-    condition_no_trigger_prompt: str,
-    layer_idx: int,
-    tokenizer: AutoTokenizer
-) -> Tensor:
-    """
-    Simple condition vector computation from a single pair of prompts.
+        self.phase_condition_vecs = {
+            name: vec.to(self.device) for name, vec in phase_condition_vecs.items()
+        }
+        self.phase_behavior_vecs = {
+            name: vec.to(self.device) for name, vec in phase_behavior_vecs.items()
+        }
+        self.phases = list(phase_condition_vecs.keys())
 
-    Args:
-        model: PI0Pytorch model
-        condition_trigger_prompt: Prompt where condition should trigger
-        condition_no_trigger_prompt: Prompt where condition should NOT trigger
-        layer_idx: Layer to extract from
-        tokenizer: Tokenizer
+        self.phase_thresholds = phase_thresholds
+        self.phase_alphas = phase_alphas
+        self.use_tanh = use_tanh
+        self.apply_steering = apply_steering
+        self.log_path = log_path
 
-    Returns:
-        Condition vector [hidden_dim]
-    """
-    return compute_condition_vector_cast(
-        model, [condition_trigger_prompt], [condition_no_trigger_prompt],
-        layer_idx, tokenizer
-    )
+        # Config metadata for logging
+        self.config_name = config_name
+        self.config_conditions = config_conditions
+        self.config_behaviors = config_behaviors
 
+        self.handle = None
 
-def setup_cast_steering(
-    model: PI0Pytorch,
-    behavior_positive_prompts: Union[str, List[str]],
-    behavior_negative_prompts: Union[str, List[str]],
-    condition_positive_prompts: Union[str, List[str]],
-    condition_negative_prompts: Union[str, List[str]],
-    layer_indices: List[int],
-    tokenizer: AutoTokenizer,
-    alpha: float = 1.0,
-    threshold: float = 0.5,
-    apply_steering: bool = True,
-    log_dir: Optional[str] = None
-) -> CASTMultiLayerHook:
-    """
-    Convenience function to set up CAST steering from prompts.
+        # State
+        self.current_phase: Optional[str] = None
+        self.phase_similarities: Dict[str, float] = {}
+        self.timestep = 0
 
-    Args:
-        model: PI0Pytorch model
-        behavior_positive_prompts: Positive behavior prompt(s) - can be single string or list
-        behavior_negative_prompts: Negative behavior prompt(s) - can be single string or list
-        condition_positive_prompts: Prompt(s) where condition should trigger
-        condition_negative_prompts: Prompt(s) where condition should NOT trigger
-        layer_indices: Layers to apply both condition checking and behavior steering
-        tokenizer: Tokenizer
-        alpha: Scaling factor
-        threshold: Similarity threshold
-        apply_steering: If True, apply steering when condition triggered
-        log_dir: Optional directory for logging
+        # Logging
+        self.similarity_history: List[Dict] = []
 
-    Returns:
-        CASTMultiLayerHook ready to be registered
-    """
-    # Convert single strings to lists
-    if isinstance(behavior_positive_prompts, str):
-        behavior_positive_prompts = [behavior_positive_prompts]
-    if isinstance(behavior_negative_prompts, str):
-        behavior_negative_prompts = [behavior_negative_prompts]
-    if isinstance(condition_positive_prompts, str):
-        condition_positive_prompts = [condition_positive_prompts]
-    if isinstance(condition_negative_prompts, str):
-        condition_negative_prompts = [condition_negative_prompts]
+    def _hook_fn(self, module, input, output):
+        """Check conditions and apply steering in a single hook"""
+        hidden = output[0] if isinstance(output, tuple) else output
 
-    # Compute behavior and condition vectors for each layer
-    behavior_vecs = {}
-    condition_vecs = {}
-    for layer_idx in layer_indices:
-        behavior_vecs[layer_idx] = compute_behavior_vector_cast(
-            model, behavior_positive_prompts, behavior_negative_prompts,
-            layer_idx, tokenizer, suffix_start_idx=None
-        )
-        condition_vecs[layer_idx] = compute_condition_vector_cast(
-            model, condition_positive_prompts, condition_negative_prompts,
-            layer_idx, tokenizer
-        )
+        # Compute similarity for each phase
+        self.phase_similarities = {}
+        max_sim = -float('inf')
+        best_phase = None
 
-    # Create and return hook
-    return CASTMultiLayerHook(
-        model=model,
-        behavior_vecs=behavior_vecs,
-        condition_vecs=condition_vecs,
-        alpha=alpha,
-        threshold=threshold,
-        apply_steering=apply_steering,
-        log_dir=log_dir
-    )
+        for phase in self.phases:
+            cond_vec = self.phase_condition_vecs[phase]
+            threshold = self.phase_thresholds.get(phase, 0.5)
 
+            triggered, similarity = check_condition(
+                hidden, cond_vec, threshold, self.use_tanh
+            )
+            self.phase_similarities[phase] = similarity
+
+            if triggered and similarity > max_sim:
+                max_sim = similarity
+                best_phase = phase
+
+        self.current_phase = best_phase
+
+        # Log
+        log_entry = {
+            'timestep': self.timestep,
+            'layer_idx': self.layer_idx,
+            'phase_similarities': dict(self.phase_similarities),
+            'detected_phase': self.current_phase,
+            'timestamp': time.time()
+        }
+        self.similarity_history.append(log_entry)
+        self.timestep += 1
+
+        # Print status
+        sims_str = ", ".join([f"{p}={s:.4f}" for p, s in self.phase_similarities.items()])
+        if self.current_phase:
+            print(f"MultiPhase CAST [L{self.layer_idx}]: Detected '{self.current_phase}' [{sims_str}]")
+        else:
+            print(f"MultiPhase CAST [L{self.layer_idx}]: No phase detected [{sims_str}]")
+
+        # Apply steering if enabled and a phase was detected
+        if self.current_phase is None:
+            return output
+
+        if not self.apply_steering:
+            return output
+
+        behavior_vec = self.phase_behavior_vecs.get(self.current_phase)
+        if behavior_vec is None:
+            return output
+
+        alpha = self.phase_alphas.get(self.current_phase, 1.0)
+
+        # Apply steering
+        modified = apply_behavior_steering(hidden, behavior_vec, alpha)
+
+        print(f"MultiPhase CAST [L{self.layer_idx}]: Steering '{self.current_phase}' (alpha={alpha})")
+
+        if isinstance(output, tuple):
+            return (modified.to(hidden.dtype),) + output[1:]
+        return modified.to(hidden.dtype)
+
+    def register(self):
+        """Register the hook"""
+        layer = self.model.paligemma_with_expert.paligemma.language_model.layers[self.layer_idx]
+        self.handle = layer.mlp.down_proj.register_forward_hook(self._hook_fn)
+
+        mode = "STEERING ENABLED" if self.apply_steering else "DETECTION ONLY (steering disabled)"
+        print(f"MultiPhase CAST: Registered hook at layer {self.layer_idx} - {mode}")
+        print(f"  Phases: {self.phases}")
+
+    def remove(self):
+        """Remove the hook and save log"""
+        if self.handle:
+            self.handle.remove()
+            self.handle = None
+
+        if self.log_path and self.similarity_history:
+            self.save_similarity_log()
+
+    def save_similarity_log(self, path: Optional[str] = None):
+        """Save similarity history to JSON"""
+        save_path = path or self.log_path
+        if not save_path:
+            return
+
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+
+        log_data = {
+            'metadata': {
+                'config_name': self.config_name,
+                'config_conditions': self.config_conditions,
+                'config_behaviors': self.config_behaviors,
+                'phases': self.phases,
+                'layer_idx': self.layer_idx,
+                'thresholds': self.phase_thresholds,
+                'alphas': self.phase_alphas,
+                'apply_steering': self.apply_steering,
+                'total_timesteps': len(self.similarity_history)
+            },
+            'history': self.similarity_history
+        }
+
+        with open(save_path, 'w') as f:
+            json.dump(log_data, f, indent=2)
+
+        print(f"MultiPhase CAST [L{self.layer_idx}]: Saved log ({len(self.similarity_history)} timesteps) to {save_path}")
+
+    def get_similarity_history(self) -> List[Dict]:
+        """Return similarity history"""
+        return self.similarity_history.copy()
+
+    def clear_history(self):
+        """Clear history and reset timestep"""
+        self.similarity_history.clear()
+        self.timestep = 0
 
 
 # =============================================================================
@@ -1960,15 +1223,14 @@ def summarize_similarity_log(log_path: str) -> Dict:
 
 if __name__ == '__main__':
     print("CAST Helpers module loaded successfully")
+    print("")
     print("Available classes:")
-    print("  - CASTSingleLayerHook: Simple single-layer CAST")
     print("  - CASTMultiLayerHook: Multi-layer CAST with per-layer condition+behavior vectors")
     print("  - MultiPhaseCASTHook: Multi-phase CAST for task phase detection")
-    print("  - MultiConditionCASTHook: Multiple conditions with OR/AND logic")
     print("")
-    print("Convenience functions:")
-    print("  - compute_behavior_vector_cast: PCA-based behavior vector extraction")
-    print("  - compute_condition_vector_cast: PCA-based condition vector extraction")
-    print("  - compute_all_concept_vectors: Compute vectors for multiple concepts from YAML")
-    print("  - compute_phase_vectors: Compute phase-specific vectors from YAML config")
-    print("  - setup_cast_steering: Quick setup from prompts")
+    print("Vector loading functions:")
+    print("  - load_precomputed_concept_vectors: Load individual concept vectors")
+    print("  - load_and_combine_precomputed_vectors: Load and combine for deployment")
+    print("  - vectors_exist: Check if precomputed vectors exist")
+    print("")
+    print("To compute vectors, use: scripts/precompute_vectors.py")
