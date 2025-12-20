@@ -117,8 +117,8 @@ def compute_all_concept_vectors(
     layer_idx: int,
     tokenizer: AutoTokenizer,
     concepts: List[str],
-    example_type: str = 'robotic_specific',
-    max_examples_per_concept: int = 100
+    example_type: str,
+    max_examples_per_concept: int
 ) -> Dict[str, Tensor]:
     """
     Compute vectors for all specified concepts from the YAML examples.
@@ -159,6 +159,10 @@ def compute_all_concept_vectors(
         )
         concept_vectors[concept] = vector
         print(f"  Computed vector with shape {vector.shape}")
+
+        # Clear GPU cache after each concept to prevent memory issues with driver 575.x
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
     return concept_vectors
 
@@ -439,8 +443,6 @@ def compute_layer_cast_vectors(
 # PRE-COMPUTED VECTOR STORAGE
 # =============================================================================
 
-VECTORS_DIR = Path(__file__).parent / "vectors"
-
 
 def precompute_and_save_all_concept_vectors(
     model: PI0Pytorch,
@@ -449,9 +451,9 @@ def precompute_and_save_all_concept_vectors(
     tokenizer: AutoTokenizer,
     condition_concepts: List[str],
     behavior_concepts: List[str],
-    example_type: str = 'robotic_specific',
-    num_examples: int = 100,
-    output_dir: Optional[Path] = None
+    example_type: str,
+    num_examples: int,
+    output_dir: Path
 ) -> Path:
     """
     Pre-compute vectors for all concepts across all layers and save to disk.
@@ -468,13 +470,11 @@ def precompute_and_save_all_concept_vectors(
         behavior_concepts: List of behavior concept names
         example_type: 'robotic_specific' or 'general_physical'
         max_examples: Max examples per concept
-        output_dir: Directory to save vectors (defaults to VECTORS_DIR)
+        output_dir: Directory to save vectors
 
     Returns:
         Path to the output directory
     """
-    output_dir = VECTORS_DIR / example_type / num_examples
-    output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     all_concepts = list(set(condition_concepts + behavior_concepts))
@@ -506,6 +506,11 @@ def precompute_and_save_all_concept_vectors(
             torch.save(vector, filepath)
             print(f"  Saved {concept} -> {filename}")
 
+        # Clear GPU cache after each layer to prevent memory issues with driver 575.x
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        print(f"  [GPU cache cleared after layer {layer_idx}]")
+
     # Save metadata
     metadata = {
         'condition_concepts': condition_concepts,
@@ -531,7 +536,7 @@ def precompute_and_save_all_concept_vectors(
 def load_precomputed_concept_vectors(
     concepts: List[str],
     layer_indices: List[int],
-    vectors_dir: Optional[Path] = None
+    vectors_dir: Path
 ) -> Dict[int, Dict[str, Tensor]]:
     """
     Load pre-computed concept vectors from disk.
@@ -539,12 +544,11 @@ def load_precomputed_concept_vectors(
     Args:
         concepts: List of concept names to load
         layer_indices: List of layer indices to load vectors for
-        vectors_dir: Directory containing saved vectors (defaults to VECTORS_DIR)
+        vectors_dir: Directory containing saved vectors
 
     Returns:
         Dict mapping layer_idx -> {concept_name -> vector}
     """
-    vectors_dir = vectors_dir or VECTORS_DIR
     vectors_dir = Path(vectors_dir)
 
     if not vectors_dir.exists():
@@ -594,7 +598,7 @@ def load_and_combine_precomputed_vectors(
         condition_combination: Dict mapping condition concept -> coefficient (-1, 0, 1)
         behavior_combination: Dict mapping behavior concept -> coefficient (-1, 0, 1)
         layer_indices: List of layer indices
-        vectors_dir: Directory containing saved vectors (defaults to VECTORS_DIR)
+        vectors_dir: Directory containing saved vectors
         normalize_condition: Whether to normalize combined condition vectors
         normalize_behavior: Whether to normalize combined behavior vectors
         device: Device to move vectors to (optional)
@@ -663,13 +667,12 @@ def get_vectors_metadata(vectors_dir: Optional[Path] = None) -> Optional[Dict]:
     Load metadata about pre-computed vectors.
 
     Args:
-        vectors_dir: Directory containing saved vectors (defaults to VECTORS_DIR)
+        vectors_dir: Directory containing saved vectors
 
     Returns:
         Metadata dict or None if not found
     """
-    vectors_dir = vectors_dir or VECTORS_DIR
-    metadata_path = Path(vectors_dir) / "metadata.json"
+    metadata_path = vectors_dir / "metadata.json"
 
     if not metadata_path.exists():
         return None
@@ -678,9 +681,8 @@ def get_vectors_metadata(vectors_dir: Optional[Path] = None) -> Optional[Dict]:
         return json.load(f)
 
 
-def vectors_exist(vectors_dir: Optional[Path] = None) -> bool:
+def vectors_exist(vectors_dir) -> bool:
     """Check if pre-computed vectors exist."""
-    vectors_dir = vectors_dir or VECTORS_DIR
     metadata_path = Path(vectors_dir) / "metadata.json"
     return metadata_path.exists()
 
@@ -916,7 +918,11 @@ def collect_hidden_states_for_cast(
     device = model.paligemma_with_expert.paligemma.device
     all_hidden_states = []
 
-    for prompt in prompts:
+    for i, prompt in enumerate(prompts):
+        # Periodic cache clearing to prevent GPU memory issues with driver 575.x
+        if i > 0 and i % 10 == 0:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
         # Tokenize
         inputs = tokenizer(text=prompt, return_tensors="pt").to(device)
         input_ids = inputs["input_ids"]
@@ -1341,68 +1347,6 @@ def apply_cast_steering(
         modified = hidden_state
 
     return modified, triggered, similarity
-
-
-
-class CASTSingleLayerHook:
-    """
-    Simplified CAST hook that applies both condition check and behavior
-    at the same layer. Useful when condition_layer == behavior_layer.
-
-    Performs the full CAST operation: h' ← h + f(sim(h, proj_c h)) · α · v
-    """
-
-    def __init__(
-        self,
-        model: PI0Pytorch,
-        condition_vec: Tensor,
-        behavior_vec: Tensor,
-        alpha: float,
-        layer_idx: int,
-        threshold: float = 0.5,
-        use_tanh: bool = True
-    ):
-        self.model = model
-        self.device = model.paligemma_with_expert.paligemma.device
-        self.condition_vec = condition_vec.to(self.device)
-        self.behavior_vec = behavior_vec.to(self.device)
-        self.alpha = alpha
-        self.layer_idx = layer_idx
-        self.threshold = threshold
-        self.use_tanh = use_tanh
-        self.handle = None
-        self.last_triggered = False
-        self.last_similarity = 0.0
-
-    def hook_fn(self, module, input, output):
-        """Hook function that applies full CAST steering"""
-        hidden = output[0] if isinstance(output, tuple) else output
-
-        modified, triggered, similarity = apply_cast_steering(
-            hidden, self.condition_vec, self.behavior_vec,
-            self.alpha, self.threshold, self.use_tanh
-        )
-
-        self.last_triggered = triggered
-        self.last_similarity = similarity
-
-        status = "APPLIED" if triggered else "SKIPPED"
-        print(f"CAST at layer {self.layer_idx}: {status} (sim={similarity:.4f})")
-
-        if isinstance(output, tuple):
-            return (modified.to(hidden.dtype),) + output[1:]
-        return modified.to(hidden.dtype)
-
-    def register(self):
-        """Register hook"""
-        layer = self.model.paligemma_with_expert.paligemma.language_model.layers[self.layer_idx]
-        self.handle = layer.mlp.down_proj.register_forward_hook(self.hook_fn)
-
-    def remove(self):
-        """Remove hook"""
-        if self.handle:
-            self.handle.remove()
-            self.handle = None
 
 
 class CASTMultiLayerHook:
@@ -1864,140 +1808,6 @@ def setup_cast_steering(
         log_dir=log_dir
     )
 
-
-# =============================================================================
-# MULTI-CONDITION SUPPORT
-# =============================================================================
-
-class MultiConditionCASTHook:
-    """
-    CAST with multiple conditions combined with logical operations.
-
-    Supports OR (any condition triggers) and AND (all conditions must trigger)
-    combinations of multiple condition vectors.
-    """
-
-    def __init__(
-        self,
-        model: PI0Pytorch,
-        behavior_vecs: Dict[int, Tensor],
-        condition_vecs: List[Tensor],
-        condition_layer_indices: List[int],
-        alpha: Union[float, Dict[int, float]],
-        threshold: float = 0.5,
-        combination_mode: str = 'or',  # 'or' or 'and'
-        use_tanh: bool = True
-    ):
-        """
-        Args:
-            model: PI0Pytorch model
-            behavior_vecs: Dict mapping layer_idx -> behavior vector
-            condition_vecs: List of condition vectors
-            condition_layer_indices: Layer index for each condition vector
-            alpha: Scaling factor
-            threshold: Similarity threshold for each condition
-            combination_mode: 'or' (any triggers) or 'and' (all must trigger)
-            use_tanh: Apply tanh to projection
-        """
-        self.model = model
-        self.device = model.paligemma_with_expert.paligemma.device
-        self.behavior_vecs = {idx: vec.to(self.device) for idx, vec in behavior_vecs.items()}
-        self.condition_vecs = [vec.to(self.device) for vec in condition_vecs]
-        self.condition_layer_indices = condition_layer_indices
-        self.threshold = threshold
-        self.combination_mode = combination_mode
-        self.use_tanh = use_tanh
-
-        if isinstance(alpha, (int, float)):
-            self.alphas = {idx: float(alpha) for idx in behavior_vecs.keys()}
-        else:
-            self.alphas = alpha
-
-        self.handles: Dict[str, any] = {}
-        self.condition_results: List[bool] = [False] * len(condition_vecs)
-        self.similarity_values: List[float] = [0.0] * len(condition_vecs)
-        self._conditions_checked: List[bool] = [False] * len(condition_vecs)
-
-    @property
-    def condition_triggered(self) -> bool:
-        """Combined condition result based on combination mode"""
-        if self.combination_mode == 'or':
-            return any(self.condition_results)
-        elif self.combination_mode == 'and':
-            return all(self.condition_results)
-        else:
-            raise ValueError(f"Unknown combination_mode: {self.combination_mode}")
-
-    def _make_condition_hook_fn(self, cond_idx: int):
-        """Create condition hook for a specific condition"""
-        condition_vec = self.condition_vecs[cond_idx]
-
-        def hook_fn(module, input, output):
-            if self._conditions_checked[cond_idx]:
-                return
-
-            hidden = output[0] if isinstance(output, tuple) else output
-            triggered, similarity = check_condition(
-                hidden, condition_vec, self.threshold, self.use_tanh
-            )
-
-            self.condition_results[cond_idx] = triggered
-            self.similarity_values[cond_idx] = similarity
-            self._conditions_checked[cond_idx] = True
-
-            status = "triggered" if triggered else "not triggered"
-            print(f"CAST Condition {cond_idx}: {status} (sim={similarity:.4f})")
-
-        return hook_fn
-
-    def _make_behavior_hook_fn(self, layer_idx: int):
-        """Create behavior hook"""
-        behavior_vec = self.behavior_vecs[layer_idx]
-        alpha = self.alphas[layer_idx]
-
-        def hook_fn(module, input, output):
-            if not self.condition_triggered:
-                return output
-
-            hidden = output[0] if isinstance(output, tuple) else output
-            modified = apply_behavior_steering(hidden, behavior_vec, alpha)
-
-            print(f"CAST: Multi-condition steering at layer {layer_idx}")
-
-            if isinstance(output, tuple):
-                return (modified.to(hidden.dtype),) + output[1:]
-            return modified.to(hidden.dtype)
-
-        return hook_fn
-
-    def register(self):
-        """Register all hooks"""
-        # Register condition hooks
-        for i, layer_idx in enumerate(self.condition_layer_indices):
-            layer = self.model.paligemma_with_expert.paligemma.language_model.layers[layer_idx]
-            self.handles[f'condition_{i}'] = layer.mlp.down_proj.register_forward_hook(
-                self._make_condition_hook_fn(i)
-            )
-
-        # Register behavior hooks
-        for layer_idx in self.behavior_vecs.keys():
-            layer = self.model.paligemma_with_expert.paligemma.language_model.layers[layer_idx]
-            self.handles[f'behavior_{layer_idx}'] = layer.mlp.down_proj.register_forward_hook(
-                self._make_behavior_hook_fn(layer_idx)
-            )
-
-    def remove(self):
-        """Remove all hooks"""
-        for handle in self.handles.values():
-            handle.remove()
-        self.handles.clear()
-
-    def reset(self):
-        """Reset for new sequence"""
-        n_conds = len(self.condition_vecs)
-        self.condition_results = [False] * n_conds
-        self.similarity_values = [0.0] * n_conds
-        self._conditions_checked = [False] * n_conds
 
 
 # =============================================================================

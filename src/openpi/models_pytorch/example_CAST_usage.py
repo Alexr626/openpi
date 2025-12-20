@@ -1,545 +1,683 @@
 """
-Example script demonstrating Conditional Activation Steering (CAST) with PaliGemma.
+Example script demonstrating Conditional Activation Steering (CAST) with pretrained PaliGemma.
 
-This script shows how to:
-1. Extract condition vectors from text-and-vision prompts
-2. Compute behavior vectors from positive/negative contrasting examples
-3. Apply conditional steering during model inference
-4. Use dynamic conditional steering that adapts to new camera frames
+This script validates the CAST implementation by:
+1. Loading precomputed condition and behavior vectors (same as used for VLA deployment)
+2. Applying multi-layer CAST during text generation
+3. Comparing baseline vs CAST outputs to verify steering is working
 
-Outputs are saved to: /home/alex/dev/piper_bimanual/CAST_results/text_only_examples/
+Uses the same vectors and configuration as VLA deployment, but on pretrained PaliGemma.
+
+Prerequisites:
+    Run scripts/precompute_vectors.py --vlm to generate the VLM vectors first.
+
+Usage:
+    python openpi/src/openpi/models_pytorch/example_CAST_usage.py
+    python openpi/src/openpi/models_pytorch/example_CAST_usage.py --mode steering
+    python openpi/src/openpi/models_pytorch/example_CAST_usage.py --alpha 6.0 --threshold 0.05
 """
+
+import sys
+from pathlib import Path
+
+# Add project paths
+project_root = Path(__file__).parent.parent.parent.parent.parent
+sys.path.insert(0, str(project_root / "openpi" / "src"))
+sys.path.insert(0, str(project_root))
 
 from transformers import AutoProcessor, AutoTokenizer, PaliGemmaForConditionalGeneration
 from PIL import Image
 import torch
+import torch.nn.functional as F
 import json
-from pathlib import Path
 from datetime import datetime
-import openpi.models.gemma as _gemma
-from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
-from openpi.models_pytorch.Activation_Engineering_helpers import (
-    get_text_based_hidden_states,
-    extract_hidden_vector,
-    compute_behavior_vector,
-    ConditionalSteeringHook,
-    SteeringHook
+from typing import Dict, List, Optional, Tuple, Union
+import numpy as np
+
+# Import constants and helpers
+from constants import (
+    LAYER_INDICES,
+    ALPHA,
+    CAST_THRESHOLD,
+    CAST_LAYER_CONFIG_PATH,
+    CAST_LAYER_CONFIG_NAME,
+    EXAMPLE_TYPE,
+    NUM_EXAMPLES,
+    VECTORS_DIR,
+    NORMALIZE_CONDITION_VECTORS,
+    NORMALIZE_BEHAVIOR_VECTORS,
+)
+from openpi.models_pytorch.CAST_helpers import (
+    load_layer_cast_config,
+    load_precomputed_concept_vectors,
+    combine_concept_vectors,
 )
 
-# TASK_DESCRIPTION = '''
-#     Choose the best tool for the following task:
 
-#   Task: Open a double-boxed package with an excessive amount of tape
-#   Tools available: Safety scissors, Very sharp scissors, Safety cutter
-#   Best tool:
-# '''
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
 
-TASK_DESCRIPTION = 'In the kitchen, I see a sharp'
+# Text generation prompt to test steering on
+TASK_PROMPT = "Finish the sentence: it's not about the __, it's about the ____"
 
-CONDITION_PROMPT = 'If prompted to choose between something safe and dangerous, choose the safe option'
-POSITIVE_EXAMPLE = 'Safe'
-NEGATIVE_EXAMPLE = 'Dangerous'
-LAYER_IDX = 2
-ALPHA = -4
-THRESHOLD = 0.3
+# Generation parameters
+MAX_NEW_TOKENS = 30
+TEMPERATURE = 0.8
+USE_IMAGE = False  # Set True to test with a dummy image
 
-RUN_CAST = True
-USE_CONDITIONAL = True
-USE_DUMMY_IMAGE = False
+# VLM vectors directory
+VLM_VECTORS_DIR = VECTORS_DIR / "vlm" / EXAMPLE_TYPE / str(NUM_EXAMPLES)
 
-OUTPUT_DIR = Path("/home/alex/dev/piper_bimanual/CAST_results/text_only_examples")
+OUTPUT_DIR = Path("/home/alex/dev/piper_bimanual/CAST_results/vlm_validation")
 
 
-def save_text_only_results(output_dir: Path, experiment_name: str,
-                           output_text_generated_baseline: str = None,
-                           output_text_generated_cast: str = None,
-                           layer_idx: int = LAYER_IDX,
-                           alpha: float = ALPHA,
-                           threshold: float = THRESHOLD,
-                           metadata: dict = None):
+# =============================================================================
+# CAST INFERENCE FUNCTIONS (adapted from CAST_helpers.py for PaliGemma)
+# =============================================================================
+
+def project_onto_condition_vector(
+    hidden_state: torch.Tensor,
+    condition_vec: torch.Tensor,
+    use_tanh: bool = True
+) -> torch.Tensor:
+    """Project hidden state onto condition vector"""
+    c = condition_vec.view(-1)
+    c_dot_c = torch.dot(c, c)
+
+    if c_dot_c < 1e-8:
+        raise ValueError("Condition vector has near-zero norm")
+
+    original_shape = hidden_state.shape
+    h_flat = hidden_state.view(-1, hidden_state.shape[-1])
+
+    h_dot_c = h_flat @ c
+    proj_coeff = h_dot_c / c_dot_c
+    projection = proj_coeff.unsqueeze(-1) * c.unsqueeze(0)
+
+    if use_tanh:
+        projection = torch.tanh(projection)
+
+    return projection.view(original_shape)
+
+
+def check_condition(
+    hidden_state: torch.Tensor,
+    condition_vec: torch.Tensor,
+    threshold: float = 0.5,
+    use_tanh: bool = True
+) -> Tuple[bool, float]:
+    """Check if condition is met for applying steering"""
+    h_avg = hidden_state.mean(dim=-2)
+    projection = project_onto_condition_vector(h_avg, condition_vec, use_tanh)
+
+    # Compute cosine similarity
+    h_flat = h_avg.view(-1, h_avg.shape[-1])
+    p_flat = projection.view(-1, projection.shape[-1])
+    similarity = F.cosine_similarity(h_flat, p_flat, dim=-1)
+
+    similarity_scalar = similarity.mean().item()
+    condition_triggered = similarity_scalar > threshold
+
+    return condition_triggered, similarity_scalar
+
+
+def apply_behavior_steering(
+    hidden_state: torch.Tensor,
+    behavior_vec: torch.Tensor,
+    alpha: float
+) -> torch.Tensor:
+    """Apply behavior vector: h' = h + α · v"""
+    v = behavior_vec.view(1, 1, -1)
+    return hidden_state + alpha * v
+
+
+class CASTMultiLayerHookForPaliGemma:
     """
-    Save text-only CAST results.
+    Multi-layer CAST hook for pretrained PaliGemma.
 
-    Args:
-        output_dir: Directory to save results
-        experiment_name: Name of the experiment
-        output_text_baseline: Baseline output (argmax decoding)
-        output_text_cast: CAST output (argmax decoding)
-        output_text_generated_baseline: Baseline output (generated)
-        output_text_generated_cast: CAST output (generated)
-        layer_idx: Layer used for steering
-        alpha: Steering strength
-        threshold: Similarity threshold
-        metadata: Additional metadata
+    This is a simplified version of CASTMultiLayerHook from CAST_helpers.py,
+    adapted to work directly with PaliGemmaForConditionalGeneration.
     """
-    # Create output directory
-    exp_dir = output_dir / experiment_name
-    exp_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create metadata JSON
-    result_data = {
-        "experiment": experiment_name,
-        "timestamp": datetime.now().isoformat(),
-        "prompts": {
-            "task_description": TASK_DESCRIPTION,
-            "condition_prompt": CONDITION_PROMPT,
-            "positive_example": POSITIVE_EXAMPLE,
-            "negative_example": NEGATIVE_EXAMPLE
-        },
-        "model_config": {
-            "layer_idx": layer_idx,
-            "alpha": alpha,
-            "threshold": threshold
-        },
-        "outputs": {
-            "vla_baseline": output_text_generated_baseline if 'vla_baseline' not in metadata else metadata.get('vla_baseline'),
-            "vla_cast": output_text_generated_cast if 'vla_cast' not in metadata else metadata.get('vla_cast'),
-            "base_pretrained_baseline": metadata.get('base_baseline') if metadata else None,
-            "base_pretrained_cast": metadata.get('base_cast') if metadata else None
-        }
-    }
+    def __init__(
+        self,
+        model: PaliGemmaForConditionalGeneration,
+        behavior_vecs: Dict[int, torch.Tensor],
+        condition_vecs: Dict[int, torch.Tensor],
+        alpha: Union[float, Dict[int, float]] = 1.0,
+        threshold: Union[float, Dict[int, float]] = 0.5,
+        use_tanh: bool = True,
+        apply_steering: bool = True,
+        verbose: bool = True
+    ):
+        self.model = model
+        self.device = model.device
 
-    # Add additional metadata if provided
-    if metadata:
-        result_data.update(metadata)
+        self.behavior_vecs = {idx: vec.to(self.device) for idx, vec in behavior_vecs.items()}
+        self.condition_vecs = {idx: vec.to(self.device) for idx, vec in condition_vecs.items()}
+        self.layer_indices = sorted(behavior_vecs.keys())
 
-    # Save metadata JSON
-    with open(exp_dir / "result.json", 'w') as f:
-        json.dump(result_data, f, indent=2)
+        self.use_tanh = use_tanh
+        self.apply_steering = apply_steering
+        self.verbose = verbose
 
-    # Save text outputs separately for easy reading
-    if output_text_generated_baseline:
-        with open(exp_dir / "vla_baseline.txt", 'w') as f:
-            f.write(output_text_generated_baseline)
+        if isinstance(alpha, (int, float)):
+            self.alphas = {idx: float(alpha) for idx in self.layer_indices}
+        else:
+            self.alphas = alpha
 
-    if output_text_generated_cast:
-        with open(exp_dir / "vla_cast.txt", 'w') as f:
-            f.write(output_text_generated_cast)
+        if isinstance(threshold, (int, float)):
+            self.thresholds = {idx: float(threshold) for idx in self.layer_indices}
+        else:
+            self.thresholds = threshold
 
-    if metadata and metadata.get('base_baseline'):
-        with open(exp_dir / "base_pretrained_baseline.txt", 'w') as f:
-            f.write(metadata['base_baseline'])
+        self.handles: Dict[int, any] = {}
+        self.similarity_history: Dict[int, List[Dict]] = {idx: [] for idx in self.layer_indices}
+        self.timestep = 0
 
-    if metadata and metadata.get('base_cast'):
-        with open(exp_dir / "base_pretrained_cast.txt", 'w') as f:
-            f.write(metadata['base_cast'])
+    def _make_hook_fn(self, layer_idx: int):
+        alpha = self.alphas.get(layer_idx, 1.0)
+        threshold = self.thresholds.get(layer_idx, 0.5)
+        condition_vec = self.condition_vecs[layer_idx]
+        behavior_vec = self.behavior_vecs[layer_idx]
 
-    print(f"   💾 Results saved to: {exp_dir}")
+        def hook_fn(module, input, output):
+            hidden = output[0] if isinstance(output, tuple) else output
 
-def example_basic_cast(layer_index,
-                       alpha,
-                       threshold):
+            triggered, similarity = check_condition(hidden, condition_vec, threshold, self.use_tanh)
+
+            self.similarity_history[layer_idx].append({
+                'timestep': self.timestep,
+                'similarity': similarity,
+                'triggered': triggered,
+                'threshold': threshold
+            })
+
+            if self.verbose:
+                status = "TRIGGERED" if triggered else "not triggered"
+                print(f"CAST [L{layer_idx}]: {status} (sim={similarity:.4f}, th={threshold})")
+
+            if triggered and self.apply_steering:
+                modified = apply_behavior_steering(hidden, behavior_vec, alpha)
+                if self.verbose:
+                    print(f"CAST [L{layer_idx}]: Steering applied (alpha={alpha})")
+
+                if isinstance(output, tuple):
+                    return (modified.to(hidden.dtype),) + output[1:]
+                return modified.to(hidden.dtype)
+
+            return output
+
+        return hook_fn
+
+    def register(self):
+        """Register hooks at all layers"""
+        for layer_idx in self.layer_indices:
+            layer = self.model.language_model.model.layers[layer_idx]
+            self.handles[layer_idx] = layer.mlp.down_proj.register_forward_hook(
+                self._make_hook_fn(layer_idx)
+            )
+        print(f"CAST: Registered hooks at layers {self.layer_indices}")
+
+    def remove(self):
+        """Remove all hooks"""
+        for handle in self.handles.values():
+            handle.remove()
+        self.handles.clear()
+
+    def step(self):
+        self.timestep += 1
+
+    def get_trigger_summary(self) -> Dict[int, Dict]:
+        """Get summary statistics per layer"""
+        summary = {}
+        for layer_idx in self.layer_indices:
+            history = self.similarity_history[layer_idx]
+            if not history:
+                continue
+
+            triggered_count = sum(1 for entry in history if entry['triggered'])
+            total = len(history)
+            similarities = [entry['similarity'] for entry in history]
+
+            summary[layer_idx] = {
+                'triggered_count': triggered_count,
+                'total_timesteps': total,
+                'trigger_rate': triggered_count / total if total > 0 else 0,
+                'similarity_mean': np.mean(similarities),
+                'similarity_std': np.std(similarities),
+                'similarity_min': np.min(similarities),
+                'similarity_max': np.max(similarities),
+            }
+        return summary
+
+
+# =============================================================================
+# VECTOR LOADING
+# =============================================================================
+
+def load_vlm_vectors(
+    config_name: str = CAST_LAYER_CONFIG_NAME,
+    layer_indices: List[int] = LAYER_INDICES,
+    vectors_dir: Path = VLM_VECTORS_DIR,
+    device: str = "cuda"
+) -> Tuple[Dict[int, torch.Tensor], Dict[int, torch.Tensor], Dict]:
     """
-    Basic example of Conditional Activation Steering.
+    Load precomputed VLM vectors and combine them according to the CAST config.
 
-    This demonstrates how to:
-    - Extract condition vector from a conditional prompt
-    - Compute behavior vector from positive/negative examples
-    - Apply steering with a static condition vector
+    Returns:
+        Tuple of (condition_vecs, behavior_vecs, config)
+        Each vec dict maps layer_idx -> combined vector
+    """
+    # Load the CAST layer config (same as used for VLA)
+    layer_config = load_layer_cast_config(
+        config_path=str(CAST_LAYER_CONFIG_PATH),
+        config_name=config_name
+    )
+
+    condition_combination = layer_config.get('condition', {})
+    behavior_combination = layer_config.get('behaviors', {})
+
+    print(f"CAST config '{config_name}':")
+    print(f"  Condition: {condition_combination}")
+    print(f"  Behavior: {behavior_combination}")
+
+    # Determine which concepts we need to load
+    used_condition_concepts = [c for c, coef in condition_combination.items() if coef != 0]
+    used_behavior_concepts = [c for c, coef in behavior_combination.items() if coef != 0]
+    all_used_concepts = list(set(used_condition_concepts + used_behavior_concepts))
+
+    if not all_used_concepts:
+        raise ValueError("No concepts have non-zero coefficients in the config")
+
+    print(f"Loading vectors for concepts: {all_used_concepts}")
+
+    # Load precomputed vectors
+    concept_vectors_by_layer = load_precomputed_concept_vectors(
+        concepts=all_used_concepts,
+        layer_indices=layer_indices,
+        vectors_dir=vectors_dir
+    )
+
+    # Combine vectors for each layer
+    condition_vecs = {}
+    behavior_vecs = {}
+
+    for layer_idx in layer_indices:
+        concept_vectors = concept_vectors_by_layer[layer_idx]
+
+        # Combine condition vectors
+        if used_condition_concepts:
+            cond_vec = combine_concept_vectors(
+                concept_vectors,
+                condition_combination,
+                normalize=NORMALIZE_CONDITION_VECTORS
+            )
+            if cond_vec is not None:
+                condition_vecs[layer_idx] = cond_vec.to(device)
+
+        # Combine behavior vectors
+        if used_behavior_concepts:
+            behav_vec = combine_concept_vectors(
+                concept_vectors,
+                behavior_combination,
+                normalize=NORMALIZE_BEHAVIOR_VECTORS
+            )
+            if behav_vec is not None:
+                behavior_vecs[layer_idx] = behav_vec.to(device)
+
+    print(f"Loaded and combined vectors for {len(condition_vecs)} layers")
+
+    return condition_vecs, behavior_vecs, layer_config
+
+
+# =============================================================================
+# MAIN EXPERIMENT
+# =============================================================================
+
+def run_cast_experiment(
+    task_prompt: str = TASK_PROMPT,
+    layer_indices: List[int] = LAYER_INDICES,
+    alpha: float = ALPHA,
+    threshold: float = CAST_THRESHOLD,
+    max_new_tokens: int = MAX_NEW_TOKENS,
+    temperature: float = TEMPERATURE,
+    use_image: bool = USE_IMAGE,
+    verbose: bool = True
+):
+    """
+    Run CAST experiment on pretrained PaliGemma using precomputed vectors.
+
+    Loads vectors, runs baseline inference, runs CAST inference,
+    and compares outputs.
     """
     print("=" * 80)
-    print("EXAMPLE 1: Basic Conditional Activation Steering")
+    print("CAST VALIDATION EXPERIMENT")
+    print("Using precomputed vectors from scripts/precompute_vectors.py --vlm")
     print("=" * 80)
 
-    # Initialize model
-    processor = AutoProcessor.from_pretrained("google/paligemma-3b-pt-224")
+    # Check if VLM vectors exist
+    if not VLM_VECTORS_DIR.exists():
+        print(f"\nERROR: VLM vectors not found at {VLM_VECTORS_DIR}")
+        print("Please run: python scripts/precompute_vectors.py --vlm")
+        return None
+
+    # Load model and tokenizer
+    print("\n1. Loading pretrained PaliGemma model...")
     tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
-    paligemma_config = _gemma.get_config('gemma_2b_lora')
-    action_expert_config = _gemma.get_config('gemma_300m_lora')
+    processor = AutoProcessor.from_pretrained("google/paligemma-3b-pt-224") if use_image else None
 
-    model_VLA = PaliGemmaWithExpertModel(
-        paligemma_config,
-        action_expert_config,
-        use_adarms=[False, True],
-        precision="bfloat16",
-    )
-    
-    model_base = PaliGemmaForConditionalGeneration.from_pretrained(
+    model = PaliGemmaForConditionalGeneration.from_pretrained(
         "google/paligemma-3b-pt-224",
-        torch_dtype=torch.float16
+        torch_dtype=torch.bfloat16
+    )
+    model.eval()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device)
+    print(f"   Model loaded on {device}")
+
+    # Load precomputed vectors
+    print(f"\n2. Loading precomputed vectors...")
+    print(f"   Vectors dir: {VLM_VECTORS_DIR}")
+    print(f"   Config: {CAST_LAYER_CONFIG_NAME}")
+
+    condition_vecs, behavior_vecs, config = load_vlm_vectors(
+        config_name=CAST_LAYER_CONFIG_NAME,
+        layer_indices=layer_indices,
+        vectors_dir=VLM_VECTORS_DIR,
+        device=device
     )
 
-    model_VLA.paligemma.eval()
-    model_base.eval()
+    if not condition_vecs or not behavior_vecs:
+        print("ERROR: No vectors loaded. Check your config and vectors directory.")
+        return None
 
-    if torch.cuda.is_available():
-        model_VLA.paligemma.to('cuda')
-        model_base.to('cuda')
+    print(f"   Loaded vectors for {len(condition_vecs)} layers")
+    print(f"   Vector shape: {list(behavior_vecs.values())[0].shape}")
 
-    # Create dummy images (in real use, these would be camera frames)
-    dummy_image = Image.new('RGB', (224, 224), color='red')
+    # Create dummy image if needed
+    image = Image.new('RGB', (224, 224), color='gray') if use_image else None
 
-    print(f"\n1. Extracting condition vector from: '{CONDITION_PROMPT}'")
+    # Prepare inputs for generation
+    print(f"\n3. Preparing inputs...")
+    print(f"   Task prompt: '{task_prompt}'")
 
-    # Step 1: Extract condition vector
-    condition_hidden_VLA = get_text_based_hidden_states(
-        model=model_VLA,
-        text=CONDITION_PROMPT,
-        layer_idx=LAYER_IDX,
-        tokenizer=tokenizer
-    )
-    condition_hidden_VLA = extract_hidden_vector(condition_hidden_VLA, pool_method='mean')
-    condition_hidden_VLA.to('cuda')
-    print(f"   Condition vector shape: {condition_hidden_VLA.shape}")
-
-    # Step 2: Compute behavior vector from positive/negative examples
-    print(f"\n2. Computing behavior vector")
-    print(f"   Positive example: '{POSITIVE_EXAMPLE}'")
-    print(f"   Negative example: '{NEGATIVE_EXAMPLE}'")
-
-    positive_hidden_VLA = get_text_based_hidden_states(
-        model=model_VLA,
-        text=POSITIVE_EXAMPLE,
-        layer_idx=layer_index,
-        tokenizer=tokenizer
-    )
-
-    positive_hidden_VLA.to('cuda')
-
-    negative_hidden_VLA = get_text_based_hidden_states(
-        model=model_VLA,
-        text=NEGATIVE_EXAMPLE,
-        layer_idx=layer_index,
-        tokenizer=tokenizer
-    )
-
-    negative_hidden_VLA.to('cuda')
-
-    behavior_vec_VLA = compute_behavior_vector(positive_hidden_VLA, negative_hidden_VLA, pool_method='mean')
-    behavior_vec_VLA.to('cuda')
-    print(f"   Behavior vector shape: {behavior_vec_VLA.shape}")
-
-
-
-    # Step 1: Extract condition vector
-    condition_hidden_VLA = get_text_based_hidden_states(
-        model=model_VLA,
-        text=CONDITION_PROMPT,
-        layer_idx=LAYER_IDX,
-        tokenizer=tokenizer
-    )
-    condition_vec_VLA = extract_hidden_vector(condition_hidden_VLA, pool_method='mean')
-    condition_vec_VLA.to('cuda')
-    print(f"   Condition vector shape: {condition_vec_VLA.shape}")
-
-    # Step 2: Compute behavior vector from positive/negative examples
-    print(f"\n2. Computing behavior vector")
-    print(f"   Positive example: '{POSITIVE_EXAMPLE}'")
-    print(f"   Negative example: '{NEGATIVE_EXAMPLE}'")
-
-    positive_hidden_VLA = get_text_based_hidden_states(
-        model=model_VLA,
-        text=POSITIVE_EXAMPLE,
-        layer_idx=layer_index,
-        tokenizer=tokenizer
-    )
-
-    positive_hidden_VLA.to('cuda')
-
-    negative_hidden_VLA = get_text_based_hidden_states(
-        model=model_VLA,
-        text=NEGATIVE_EXAMPLE,
-        layer_idx=layer_index,
-        tokenizer=tokenizer
-    )
-
-    negative_hidden_VLA.to('cuda')
-
-    behavior_vec_VLA = compute_behavior_vector(positive_hidden_VLA, negative_hidden_VLA, pool_method='mean')
-    behavior_vec_VLA.to('cuda')
-    print(f"   Behavior vector shape: {behavior_vec_VLA.shape}")
-
-
-    # Step 3: Apply conditional steering during inference
-    print(f"\n3. Setting up conditional steering hook")
-    print(f"   Alpha (steering strength): {alpha}")
-    print(f"   Threshold: {threshold}")
-    print(f"   Layer: {layer_index}")
-
-    if USE_CONDITIONAL:
-        hook = ConditionalSteeringHook(
-            model=model_VLA,
-            condition_vec=condition_vec_VLA,
-            behavior_vec=behavior_vec_VLA,
-            alpha=alpha,
-            layer_idx=layer_index,
-            threshold=threshold,
-            use_tanh=True
-        )
+    if use_image and processor is not None:
+        inputs = processor(text=task_prompt, images=image, return_tensors="pt").to(device)
     else:
-        hook = SteeringHook(model=model_VLA,
-                            steering_vec=behavior_vec_VLA,
-                            alpha=alpha,
-                            layer_idx=layer_index)
+        inputs = tokenizer(text=task_prompt, return_tensors="pt").to(device)
 
-    # Run baseline inference (WITHOUT CAST - hook not registered yet)
-    print(f"\n4. Running baseline inference (NO CAST)")
-    
-    if USE_DUMMY_IMAGE:
-        inputs = processor(
-            text=TASK_DESCRIPTION,
-            images=dummy_image,
-            return_tensors="pt"
-        ).to(model_VLA.paligemma.device)
-        
-    else: 
-        inputs = tokenizer(
-        text=TASK_DESCRIPTION,
-        return_tensors="pt").to(model_VLA.paligemma.device)
-
-
+    # Run baseline inference (NO CAST)
+    print(f"\n4. Running BASELINE inference (no CAST)...")
     with torch.no_grad():
-        with torch.autocast('cuda'):
-            output_ids_baseline = model_VLA.paligemma.generate(**inputs, max_new_tokens=20, do_sample=True, temperature=0.8, pad_token_id= tokenizer.eos_token_id)
-
-    # Decode baseline outputs
-    if USE_DUMMY_IMAGE:
-        baseline_text_generated = processor.decode(output_ids_baseline[0], skip_special_tokens=True)
-
-    else:
-        baseline_text_generated = tokenizer.decode(output_ids_baseline[0], skip_special_tokens=True)
-
-
-    print(f"   Baseline (generated): {baseline_text_generated}")
-
-    if RUN_CAST:
-        # Run inference WITH CAST
-        print(f"\n5. Running inference WITH CAST")
-        hook.register()  # Register hook
-
-        with torch.no_grad():
-            with torch.autocast('cuda'):
-                output_ids_cast = model_VLA.paligemma.generate(**inputs, max_new_tokens=20, do_sample=True)
-
-
-        # Decode CAST outputs
-        if USE_DUMMY_IMAGE:
-            cast_text_generated = processor.decode(output_ids_cast[0], skip_special_tokens=True)
-
-        else:
-            cast_text_generated = tokenizer.decode(output_ids_cast[0], skip_special_tokens=True)
-
-        print(f"   VLA CAST (generated): {cast_text_generated}")
-
-        hook.remove()
-
-    # Now run the same experiments on the base pretrained model
-    print(f"\n6. Running SAME experiments on BASE PRETRAINED model for comparison")
-    print("=" * 80)
-
-    # Create hook for base model (use same steering vector)
-    if USE_CONDITIONAL:
-        hook_base = ConditionalSteeringHook(
-            model=PaliGemmaWithExpertModel(
-                paligemma_config,
-                action_expert_config,
-                use_adarms=[False, True],
-                precision="bfloat16",
-            ),
-            condition_vec=condition_vec_VLA,
-            behavior_vec=behavior_vec_VLA,
-            alpha=alpha,
-            layer_idx=layer_index,
-            threshold=threshold,
-            use_tanh=True
-        )
-        # Replace the paligemma attribute with base model
-        hook_base.model = model_base
-    else:
-        # For SteeringHook, we need to create a wrapper
-        class BaseModelWrapper:
-            def __init__(self, base_model):
-                self.paligemma = base_model
-
-        wrapper = BaseModelWrapper(model_base)
-        hook_base = SteeringHook(
-            model=wrapper,
-            steering_vec=behavior_vec_VLA,
-            alpha=alpha,
-            layer_idx=layer_index
+        baseline_output_ids = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=temperature,
+            pad_token_id=tokenizer.eos_token_id
         )
 
-    # Base model baseline (no CAST)
-    print(f"\n6a. Base model baseline (NO CAST)")
-    with torch.no_grad():
-        with torch.autocast('cuda'):
-            output_ids_base_baseline = model_base.generate(**inputs, max_new_tokens=20, do_sample=True, temperature=0.8)
+    baseline_text = tokenizer.decode(baseline_output_ids[0], skip_special_tokens=True)
+    print(f"   Baseline output: {baseline_text}")
 
-    if USE_DUMMY_IMAGE:
-        base_baseline_text = processor.decode(output_ids_base_baseline[0], skip_special_tokens=True)
-    else:
-        base_baseline_text = tokenizer.decode(output_ids_base_baseline[0], skip_special_tokens=True)
+    # Create and register CAST hook
+    print(f"\n5. Running CAST inference...")
+    print(f"   Alpha: {alpha}, Threshold: {threshold}")
 
-    print(f"   Base baseline (generated): {base_baseline_text}")
-
-
-    if RUN_CAST:
-        # Base model WITH CAST
-        print(f"\n6b. Base model WITH CAST")
-        hook_base.register()
-
-        with torch.no_grad():
-            with torch.autocast('cuda'):
-                output_ids_base_cast = model_base.generate(**inputs, max_new_tokens=20, do_sample=True, temperature=0.8, pad_token_id=tokenizer.eos_token_id)
-
-        if USE_DUMMY_IMAGE:
-            base_cast_text = processor.decode(output_ids_base_cast[0], skip_special_tokens=True)
-        else:
-            base_cast_text = tokenizer.decode(output_ids_base_cast[0], skip_special_tokens=True)
-
-        print(f"   Base CAST (generated): {base_cast_text}")
-
-        hook_base.remove()
-
-    # Compare ALL outputs
-    print(f"\n7. COMPREHENSIVE COMPARISON:")
-    print("=" * 80)
-    print(f"VLA Model:")
-    print(f"  Baseline: {baseline_text_generated}")
-    if RUN_CAST:
-        print(f"  CAST:     {cast_text_generated}")
-    print(f"")
-    print(f"Base Pretrained Model:")
-    print(f"  Baseline: {base_baseline_text}")
-    if RUN_CAST:
-        print(f"  CAST:     {base_cast_text}")
-    print("=" * 80)
-
-    if RUN_CAST:
-        if baseline_text_generated != cast_text_generated:
-            print(f"   ✅ VLA: CAST modified the output!")
-        else:
-            print(f"   ⚠️  VLA: Outputs are identical")
-
-        if base_baseline_text != base_cast_text:
-            print(f"   ✅ Base: CAST modified the output!")
-        else:
-            print(f"   ⚠️  Base: Outputs are identical")
-
-    # Check if VLA outputs are coherent compared to base
-    print(f"\n8. Coherence Analysis:")
-    if len(baseline_text_generated) < 10 or baseline_text_generated.count(' ') < 2:
-        print(f"   ⚠️  WARNING: VLA baseline output appears incoherent!")
-    else:
-        print(f"   ✅ VLA baseline output appears coherent")
-
-    if len(base_baseline_text) < 10 or base_baseline_text.count(' ') < 2:
-        print(f"   ⚠️  WARNING: Base baseline output appears incoherent!")
-    else:
-        print(f"   ✅ Base baseline output appears coherent")
-
-    # Save results
-    print(f"\n9. Saving results...")
-    save_text_only_results(
-        output_dir=OUTPUT_DIR,
-        experiment_name="basic_cast_example",
-        output_text_generated_baseline=baseline_text_generated,
-        output_text_generated_cast=cast_text_generated,
-        layer_idx=layer_index,
+    cast_hook = CASTMultiLayerHookForPaliGemma(
+        model=model,
+        behavior_vecs=behavior_vecs,
+        condition_vecs=condition_vecs,
         alpha=alpha,
         threshold=threshold,
-        metadata={
-            'base_baseline': base_baseline_text,
-            'base_cast': base_cast_text
-        }
+        use_tanh=True,
+        apply_steering=True,
+        verbose=verbose
     )
 
-    print(f"\n10. All hooks removed and results saved")
-    print("\n" + "=" * 80 + "\n")
+    cast_hook.register()
+
+    with torch.no_grad():
+        cast_output_ids = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=temperature,
+            pad_token_id=tokenizer.eos_token_id
+        )
+
+    cast_hook.remove()
+
+    cast_text = tokenizer.decode(cast_output_ids[0], skip_special_tokens=True)
+    print(f"\n   CAST output: {cast_text}")
+
+    # Print summary
+    print("\n" + "=" * 80)
+    print("RESULTS SUMMARY")
+    print("=" * 80)
+    print(f"\nPrompt: '{task_prompt}'")
+    print(f"\nBaseline: {baseline_text}")
+    print(f"\nCAST:     {cast_text}")
+
+    if baseline_text != cast_text:
+        print(f"\n  CAST modified the output!")
+    else:
+        print(f"\n  Outputs are identical - try adjusting alpha or threshold")
+
+    # Print trigger summary
+    print("\n" + "-" * 40)
+    print("Trigger Statistics by Layer:")
+    trigger_summary = cast_hook.get_trigger_summary()
+    for layer_idx, stats in trigger_summary.items():
+        print(f"  Layer {layer_idx}: triggered {stats['triggered_count']}/{stats['total_timesteps']} times "
+              f"(rate: {stats['trigger_rate']:.2%}), "
+              f"sim: {stats['similarity_mean']:.4f} +/- {stats['similarity_std']:.4f}")
+
+    # Save results
+    if OUTPUT_DIR:
+        save_results(
+            output_dir=OUTPUT_DIR,
+            baseline_text=baseline_text,
+            cast_text=cast_text,
+            task_prompt=task_prompt,
+            layer_indices=layer_indices,
+            alpha=alpha,
+            threshold=threshold,
+            config=config,
+            trigger_summary=trigger_summary
+        )
+
+    return {
+        'baseline': baseline_text,
+        'cast': cast_text,
+        'trigger_summary': trigger_summary
+    }
 
 
-
-def example_cast_analysis():
+def run_steering_only_experiment(
+    task_prompt: str = TASK_PROMPT,
+    alpha: float = ALPHA,
+):
     """
-    Analytical example showing how CAST components work.
+    Run experiment with UNCONDITIONAL steering (no condition check).
 
-    This demonstrates the internal mechanics:
-    - Projection onto condition vector
-    - Similarity computation
-    - Threshold application
+    This validates that the steering vectors themselves work,
+    independent of the condition checking logic.
     """
     print("=" * 80)
-    print("EXAMPLE 3: Understanding CAST Mechanics")
+    print("STEERING-ONLY VALIDATION (No condition check)")
+    print("Using precomputed vectors from scripts/precompute_vectors.py --vlm")
     print("=" * 80)
 
-    from openpi.models_pytorch.Activation_Engineering_helpers import (
-        project_onto_condition,
-        compute_similarity,
-        apply_threshold_function,
-        apply_conditional_steering
+    # Check if VLM vectors exist
+    if not VLM_VECTORS_DIR.exists():
+        print(f"\nERROR: VLM vectors not found at {VLM_VECTORS_DIR}")
+        print("Please run: python scripts/precompute_vectors.py --vlm")
+        return None
+
+    print("\n1. Loading pretrained PaliGemma model...")
+    tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
+
+    model = PaliGemmaForConditionalGeneration.from_pretrained(
+        "google/paligemma-3b-pt-224",
+        torch_dtype=torch.bfloat16
+    )
+    model.eval()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device)
+
+    # Load precomputed vectors
+    print(f"\n2. Loading precomputed vectors...")
+    condition_vecs, behavior_vecs, config = load_vlm_vectors(
+        config_name=CAST_LAYER_CONFIG_NAME,
+        layer_indices=LAYER_INDICES,
+        vectors_dir=VLM_VECTORS_DIR,
+        device=device
     )
 
-    # Create synthetic data
-    print("\n1. Creating synthetic hidden states and vectors")
+    # Prepare inputs
+    inputs = tokenizer(text=task_prompt, return_tensors="pt").to(device)
 
-    hidden_dim = 2048
-    seq_len = 10
-    batch_size = 1
+    # Baseline
+    print(f"\n3. Running BASELINE inference...")
+    with torch.no_grad():
+        baseline_output_ids = model.generate(
+            **inputs,
+            max_new_tokens=MAX_NEW_TOKENS,
+            do_sample=True,
+            temperature=TEMPERATURE,
+            pad_token_id=tokenizer.eos_token_id
+        )
+    baseline_text = tokenizer.decode(baseline_output_ids[0], skip_special_tokens=True)
+    print(f"   Baseline: {baseline_text}")
 
-    # Simulate hidden state
-    hidden_state = torch.randn(batch_size, seq_len, hidden_dim)
+    # Steering (unconditional)
+    print(f"\n4. Running STEERED inference (unconditional, alpha={alpha})...")
 
-    # Simulate condition and behavior vectors
-    condition_vec = torch.randn(hidden_dim)
-    condition_vec = condition_vec / condition_vec.norm()  # Normalize
+    handles = []
 
-    behavior_vec = torch.randn(hidden_dim)
+    def make_steering_hook(layer_idx):
+        vec = behavior_vecs[layer_idx]
+        def hook_fn(module, input, output):
+            hidden = output[0] if isinstance(output, tuple) else output
+            modified = hidden + alpha * vec.view(1, 1, -1)
+            if isinstance(output, tuple):
+                return (modified.to(hidden.dtype),) + output[1:]
+            return modified.to(hidden.dtype)
+        return hook_fn
 
-    print(f"   Hidden state shape: {hidden_state.shape}")
-    print(f"   Condition vector shape: {condition_vec.shape}")
-    print(f"   Behavior vector shape: {behavior_vec.shape}")
+    for layer_idx in behavior_vecs.keys():
+        layer = model.language_model.model.layers[layer_idx]
+        handle = layer.mlp.down_proj.register_forward_hook(make_steering_hook(layer_idx))
+        handles.append(handle)
 
-    # Step 2: Project hidden state onto condition
-    print("\n2. Projecting hidden state onto condition vector")
-    projection = project_onto_condition(hidden_state, condition_vec, use_tanh=True)
-    print(f"   Projection shape: {projection.shape}")
-    print(f"   Projection range: [{projection.min():.4f}, {projection.max():.4f}]")
+    with torch.no_grad():
+        steered_output_ids = model.generate(
+            **inputs,
+            max_new_tokens=MAX_NEW_TOKENS,
+            do_sample=True,
+            temperature=TEMPERATURE,
+            pad_token_id=tokenizer.eos_token_id
+        )
 
-    # Step 3: Compute similarity
-    print("\n3. Computing cosine similarity between hidden state and projection")
-    similarity = compute_similarity(hidden_state, projection)
-    print(f"   Similarity shape: {similarity.shape}")
-    print(f"   Similarity range: [{similarity.min():.4f}, {similarity.max():.4f}]")
-    print(f"   Similarity values per token: {similarity[0].tolist()}")
+    for handle in handles:
+        handle.remove()
 
-    # Step 4: Apply threshold
-    print("\n4. Applying threshold function (threshold=0.5)")
-    mask = apply_threshold_function(similarity, threshold=0.5)
-    print(f"   Mask shape: {mask.shape}")
-    print(f"   Mask values: {mask[0].tolist()}")
-    print(f"   Number of activated positions: {mask.sum().item()}/{seq_len}")
+    steered_text = tokenizer.decode(steered_output_ids[0], skip_special_tokens=True)
+    print(f"   Steered: {steered_text}")
 
-    # Step 5: Apply full conditional steering
-    print("\n5. Applying full conditional steering (alpha=2.0)")
-    modified_hidden = apply_conditional_steering(
-        hidden_state=hidden_state,
-        condition_vec=condition_vec,
-        behavior_vec=behavior_vec,
-        alpha=2.0,
-        threshold=0.5,
-        use_tanh=True
-    )
-    print(f"   Modified hidden state shape: {modified_hidden.shape}")
+    print("\n" + "=" * 80)
+    print("COMPARISON")
+    print("=" * 80)
+    print(f"Baseline: {baseline_text}")
+    print(f"Steered:  {steered_text}")
 
-    # Analyze the change
-    change = (modified_hidden - hidden_state).abs().mean()
-    print(f"   Mean absolute change: {change.item():.6f}")
+    if baseline_text != steered_text:
+        print("\n  Steering modified the output!")
+    else:
+        print("\n  Outputs are identical")
 
-    print("\n" + "=" * 80 + "\n")
+    return {
+        'baseline': baseline_text,
+        'steered': steered_text
+    }
+
+
+def save_results(
+    output_dir: Path,
+    baseline_text: str,
+    cast_text: str,
+    task_prompt: str,
+    layer_indices: List[int],
+    alpha: float,
+    threshold: float,
+    config: Dict,
+    trigger_summary: Dict
+):
+    """Save experiment results to disk"""
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    exp_dir = output_dir / f"cast_validation_{timestamp}"
+    exp_dir.mkdir(parents=True, exist_ok=True)
+
+    result_data = {
+        "timestamp": datetime.now().isoformat(),
+        "task_prompt": task_prompt,
+        "cast_config": {
+            "config_name": CAST_LAYER_CONFIG_NAME,
+            "condition": config.get('condition', {}),
+            "behaviors": config.get('behaviors', {}),
+        },
+        "parameters": {
+            "layer_indices": layer_indices,
+            "alpha": alpha,
+            "threshold": threshold,
+            "vectors_dir": str(VLM_VECTORS_DIR),
+        },
+        "outputs": {
+            "baseline": baseline_text,
+            "cast": cast_text,
+        },
+        "trigger_summary": {str(k): v for k, v in trigger_summary.items()}
+    }
+
+    with open(exp_dir / "results.json", 'w') as f:
+        json.dump(result_data, f, indent=2)
+
+    with open(exp_dir / "baseline.txt", 'w') as f:
+        f.write(baseline_text)
+
+    with open(exp_dir / "cast.txt", 'w') as f:
+        f.write(cast_text)
+
+    print(f"\n  Results saved to: {exp_dir}")
 
 
 if __name__ == "__main__":
-    print("\n" + "=" * 80)
-    print("CONDITIONAL ACTIVATION STEERING (CAST) EXAMPLES")
-    print("=" * 80 + "\n")
+    import argparse
 
-    # Run examples
-    example_basic_cast(layer_index=LAYER_IDX,
-                        alpha=ALPHA,
-                        threshold=THRESHOLD)
+    parser = argparse.ArgumentParser(description="Validate CAST implementation on pretrained PaliGemma")
+    parser.add_argument("--mode", choices=["cast", "steering"], default="cast",
+                       help="'cast' for full CAST, 'steering' for unconditional steering only")
+    parser.add_argument("--alpha", type=float, default=ALPHA, help="Steering strength")
+    parser.add_argument("--threshold", type=float, default=CAST_THRESHOLD, help="Condition threshold")
+    parser.add_argument("--quiet", action="store_true", help="Reduce verbosity")
+    parser.add_argument("--prompt", type=str, default=TASK_PROMPT, help="Task prompt to test")
 
-    example_cast_analysis()
+    args = parser.parse_args()
 
-    print("\n" + "=" * 80)
-    print("ALL EXAMPLES COMPLETED")
-    print("=" * 80 + "\n")
+    if args.mode == "cast":
+        run_cast_experiment(
+            task_prompt=args.prompt,
+            alpha=args.alpha,
+            threshold=args.threshold,
+            verbose=not args.quiet
+        )
+    else:
+        run_steering_only_experiment(
+            task_prompt=args.prompt,
+            alpha=args.alpha
+        )
