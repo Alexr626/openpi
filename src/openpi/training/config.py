@@ -678,6 +678,16 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
+# Adding freezing filter that freezes entire PaliGemma backbone during fine-tuning
+import openpi.shared.nnx_utils as nnx_utils
+import flax.nnx as nnx
+
+PaliGemma_freeze_filter = nnx.All(
+    nnx_utils.PathRegex(".*llm.*"),        # All LLM params
+    nnx.Not(nnx_utils.PathRegex(".*llm.*_1.*"))  # Except action expert
+)
+
+
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     #
@@ -1178,6 +1188,58 @@ _CONFIGS = [
         keep_period=5000,
         save_interval=500
     ),
+    TrainConfig(
+        name="pi05_franka_frozen_vlm",
+        model=pi0_config.Pi0Config(
+            pi05=True, 
+            action_horizon=ACTION_HORIZON, 
+            paligemma_variant="gemma_2b",      # No LoRA
+            action_expert_variant="gemma_300m"  # No LoRA - full 300M trainable
+        ),
+        data=LeRobotPickAndPlaceDataConfig(
+            assets=AssetsConfig(
+                assets_dir=BASE_ASSETS_DIR,
+                asset_id=os.path.join('pi05_franka_frozen_vlm', REPO_ID)
+            ),
+            repo_id=REPO_ID,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        freeze_filter=nnx.All(
+            nnx_utils.PathRegex(".*llm.*"),
+            nnx.Not(nnx_utils.PathRegex(".*llm.*_1.*"))
+        ),
+        pytorch_weight_path=PYTORCH_WEIGHT_PATH,
+        num_train_steps=5000,
+        use_8bit_adam=True,
+        keep_period=5000,
+        save_interval=500
+    ),
+    TrainConfig(
+        name="pi05_franka_finetuned_frozen_vlm",
+        model=pi0_config.Pi0Config(
+            pi05=True, 
+            action_horizon=ACTION_HORIZON, 
+            paligemma_variant="gemma_2b",      # No LoRA
+            action_expert_variant="gemma_300m"  # No LoRA - full 300M trainable
+        ),
+        data=LeRobotPickAndPlaceDataConfig(
+            assets=AssetsConfig(
+                assets_dir=FINETUNED_CHECKPOINT_DIR,
+                asset_id=os.path.join('pi05_franka_frozen_vlm', REPO_ID)
+            ),
+            repo_id=REPO_ID,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        freeze_filter=nnx.All(
+            nnx_utils.PathRegex(".*llm.*"),
+            nnx.Not(nnx_utils.PathRegex(".*llm.*_1.*"))
+        ),
+        pytorch_weight_path=FINETUNED_CHECKPOINT_DIR,
+        num_train_steps=5000,
+        use_8bit_adam=True,
+        keep_period=5000,
+        save_interval=500
+    )
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
