@@ -47,11 +47,17 @@ uv pip install -e packages/openpi-client
 uv pip install -e third_party/libero
 export PYTHONPATH=$PYTHONPATH:$PWD/third_party/libero
 
-# Run the simulation
-python examples/libero/main.py
+# Run the simulation (with determinism environment variables)
+CUBLAS_WORKSPACE_CONFIG=:4096:8 PYTHONHASHSEED=0 python examples/libero/main.py
 
 # To run with glx for Mujoco instead (use this if you have egl errors):
-MUJOCO_GL=glx python examples/libero/main.py
+CUBLAS_WORKSPACE_CONFIG=:4096:8 PYTHONHASHSEED=0 MUJOCO_GL=glx python examples/libero/main.py
+
+# To run with on-screen rendering (to visualize the simulation):
+CUBLAS_WORKSPACE_CONFIG=:4096:8 PYTHONHASHSEED=0 MUJOCO_GL=glx python examples/libero/main.py --render
+
+# To run with multiple seeds for statistical significance:
+CUBLAS_WORKSPACE_CONFIG=:4096:8 PYTHONHASHSEED=0 MUJOCO_GL=glx python examples/libero/main.py --seed 7 --num-seeds 3
 ```
 
 Terminal window 2:

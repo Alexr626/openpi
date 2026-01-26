@@ -169,4 +169,4 @@ cython_debug/
 
 debug_piper_images/
 DEBUG_PIPER_IMAGES.md
-openpi/src/openpi/models_pytorch/vectors/*
+src/openpi/models_pytorch/vectors/*

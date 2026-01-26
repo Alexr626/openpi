@@ -1,27 +1,44 @@
 """
-Conditional Activation Steering (CAST) Implementation for Pi 0.5 VLA
+Activation Steering Implementations for Pi 0.5 VLA
 
-Based on: "PROGRAMMING REFUSAL WITH CONDITIONAL ACTIVATION STEERING" by Lee et al. (2025)
+This module implements two activation steering methods:
 
-CAST extends Activation Engineering by adding a condition vector that determines
-when to apply the behavior steering. The modified hidden state is computed as:
-    h' ← h + f(sim(h, proj_c h)) · α · v
+1. CAST (Conditional Activation Steering)
+   Based on: "PROGRAMMING REFUSAL WITH CONDITIONAL ACTIVATION STEERING" by Lee et al. (2025)
 
-Where:
-    - h: original hidden state
-    - c: condition vector
-    - v: behavior vector
-    - α: scaling factor
-    - f: thresholding function (outputs 1 if similarity > θ, else 0)
-    - proj_c h = (c⊗c / c·c) h: projection of h onto c
-    - sim(h, g) = h·g / (|h||g|): cosine similarity
+   CAST extends Activation Engineering by adding a condition vector that determines
+   when to apply the behavior steering. The modified hidden state is computed as:
+       h' ← h + f(sim(h, proj_c h)) · α · v
+
+   Where:
+       - h: original hidden state
+       - c: condition vector
+       - v: behavior vector
+       - α: scaling factor
+       - f: thresholding function (outputs 1 if similarity > θ, else 0)
+       - proj_c h = (c⊗c / c·c) h: projection of h onto c
+       - sim(h, g) = h·g / (|h||g|): cosine similarity
+
+2. VTI (Visual and Textual Intervention)
+   Based on: "Reducing Hallucinations in Large Vision-Language Models via Latent Space Steering"
+
+   VTI applies steering vectors unconditionally to both the language model residual stream
+   and the vision encoder residual stream to reduce hallucinations:
+       h' = h + α * v
+
+   VTI vectors are computed from:
+   - Textual: differences between hallucinated vs non-hallucinated caption hidden states
+   - Visual: differences between corrupted vs original image hidden states
+   - PCA is applied to extract the principal direction from these differences
 
 This module contains:
-- Runtime functions for applying CAST during inference (hooks, condition checking, steering)
+- Runtime functions for applying CAST/VTI during inference (hooks, condition checking, steering)
 - Functions for loading pre-computed vectors from disk
 - YAML/config loading utilities
 
-Vector computation functions are in scripts/precompute_vectors.py
+Vector computation functions are in:
+- scripts/precompute_vectors_CAST.py (for CAST)
+- scripts/precompute_vectors_VTI.py (for VTI)
 """
 
 import os
@@ -1221,16 +1238,309 @@ def summarize_similarity_log(log_path: str) -> Dict:
     }
 
 
+# =============================================================================
+# VTI (VISUAL AND TEXTUAL INTERVENTION) HOOK
+# =============================================================================
+
+def load_vti_vectors(
+    layer_indices_text: List[int],
+    layer_indices_vision: List[int],
+    vectors_dir: Path,
+    device: Optional[str] = None
+) -> Tuple[Dict[int, Tensor], Dict[int, Tensor]]:
+    """
+    Load pre-computed VTI vectors from disk.
+
+    VTI vectors are applied unconditionally to steer the model away from
+    hallucination patterns. They are computed from paired examples of
+    hallucinated vs non-hallucinated captions (textual) and corrupted vs
+    original images (visual).
+
+    Args:
+        layer_indices_text: Layer indices to load textual vectors for (Gemma backbone)
+        layer_indices_vision: Layer indices to load visual vectors for (SigLIP encoder)
+        vectors_dir: Directory containing saved VTI vectors
+        device: Device to move vectors to (optional)
+
+    Returns:
+        Tuple of (textual_vecs, visual_vecs)
+        - textual_vecs: Dict mapping layer_idx -> vector [hidden_dim]
+        - visual_vecs: Dict mapping layer_idx -> vector [n_tokens, hidden_dim]
+    """
+    vectors_dir = Path(vectors_dir)
+
+    if not vectors_dir.exists():
+        raise FileNotFoundError(f"VTI vectors directory not found: {vectors_dir}")
+
+    textual_vecs = {}
+    visual_vecs = {}
+    missing = []
+
+    # Load textual vectors
+    for layer_idx in layer_indices_text:
+        filename = f"textual_layer{layer_idx}.pt"
+        filepath = vectors_dir / filename
+        if filepath.exists():
+            vec = torch.load(filepath, weights_only=True)
+            if device:
+                vec = vec.to(device)
+            textual_vecs[layer_idx] = vec
+        else:
+            missing.append(filename)
+
+    # Load visual vectors
+    for layer_idx in layer_indices_vision:
+        filename = f"visual_layer{layer_idx}.pt"
+        filepath = vectors_dir / filename
+        if filepath.exists():
+            vec = torch.load(filepath, weights_only=True)
+            if device:
+                vec = vec.to(device)
+            visual_vecs[layer_idx] = vec
+        else:
+            missing.append(filename)
+
+    if missing:
+        raise FileNotFoundError(
+            f"Missing VTI vectors: {missing}. "
+            f"Run scripts/precompute_vectors_VTI.py first."
+        )
+
+    print(f"Loaded VTI vectors from {vectors_dir}:")
+    print(f"  Textual: {len(textual_vecs)} layers")
+    print(f"  Visual: {len(visual_vecs)} layers")
+
+    return textual_vecs, visual_vecs
+
+
+def get_vti_metadata(vectors_dir: Path) -> Optional[Dict]:
+    """
+    Load metadata about pre-computed VTI vectors.
+
+    Args:
+        vectors_dir: Directory containing saved VTI vectors
+
+    Returns:
+        Metadata dict or None if not found
+    """
+    metadata_path = Path(vectors_dir) / "metadata.json"
+
+    if not metadata_path.exists():
+        return None
+
+    with open(metadata_path, 'r') as f:
+        return json.load(f)
+
+
+class VTIHook:
+    """
+    Visual and Textual Intervention (VTI) Hook for unconditional steering.
+
+    Based on: "Reducing Hallucinations in Large Vision-Language Models via
+    Latent Space Steering" (VTI paper)
+
+    VTI applies steering vectors unconditionally to both:
+    1. The residual stream of the language model (Gemma 2B backbone)
+    2. The residual stream of the vision encoder (SigLIP)
+
+    Unlike CAST which uses conditional activation steering based on similarity
+    thresholds, VTI vectors are always applied during inference to push the
+    model away from hallucination patterns.
+
+    The steering is applied as: h' = h + α * v
+    where h is the hidden state, v is the steering vector, and α is the scaling factor.
+    """
+
+    def __init__(
+        self,
+        model: PI0Pytorch,
+        textual_vecs: Dict[int, Tensor],
+        visual_vecs: Dict[int, Tensor],
+        alpha_text: float = 1.0,
+        alpha_vision: float = 1.0,
+        normalize_text: bool = False,
+        normalize_vision: bool = False
+    ):
+        """
+        Args:
+            model: PI0Pytorch model
+            textual_vecs: Dict mapping layer_idx -> textual steering vector [hidden_dim]
+            visual_vecs: Dict mapping layer_idx -> visual steering vector [n_tokens, hidden_dim]
+            alpha_text: Scaling factor for textual steering
+            alpha_vision: Scaling factor for visual steering
+            normalize_text: Whether to normalize textual vectors before applying
+            normalize_vision: Whether to normalize visual vectors before applying
+        """
+        self.model = model
+        self.device = model.paligemma_with_expert.paligemma.device
+
+        # Move vectors to device and optionally normalize
+        self.textual_vecs = {}
+        for idx, vec in textual_vecs.items():
+            vec = vec.to(self.device)
+            if normalize_text:
+                norm = torch.norm(vec)
+                if norm > 1e-8:
+                    vec = vec / norm
+            self.textual_vecs[idx] = vec
+
+        self.visual_vecs = {}
+        for idx, vec in visual_vecs.items():
+            vec = vec.to(self.device)
+            if normalize_vision:
+                # For visual vectors [n_tokens, hidden_dim], normalize along hidden_dim
+                norm = torch.norm(vec, dim=-1, keepdim=True)
+                norm = torch.clamp(norm, min=1e-8)
+                vec = vec / norm
+            self.visual_vecs[idx] = vec
+
+        self.alpha_text = alpha_text
+        self.alpha_vision = alpha_vision
+
+        self.text_layer_indices = sorted(textual_vecs.keys())
+        self.vision_layer_indices = sorted(visual_vecs.keys())
+
+        # Hook handles
+        self.text_handles: Dict[int, any] = {}
+        self.vision_handles: Dict[int, any] = {}
+
+        # Tracking
+        self.timestep = 0
+        self.steering_history: List[Dict] = []
+
+    def _make_text_hook_fn(self, layer_idx: int):
+        """Create hook function for textual steering at a specific layer."""
+        vec = self.textual_vecs[layer_idx]
+
+        def hook_fn(module, input, output):
+            # Output is (hidden_states,) or (hidden_states, attn_weights)
+            hidden = output[0] if isinstance(output, tuple) else output
+
+            # Apply unconditional steering: h' = h + α * v
+            # vec shape: [hidden_dim]
+            # hidden shape: [batch, seq_len, hidden_dim]
+            # Broadcast vec to match hidden shape
+            steering = self.alpha_text * vec.view(1, 1, -1)
+            modified = hidden + steering.to(hidden.dtype)
+
+            if isinstance(output, tuple):
+                return (modified,) + output[1:]
+            return modified
+
+        return hook_fn
+
+    def _make_vision_hook_fn(self, layer_idx: int):
+        """Create hook function for visual steering at a specific layer."""
+        vec = self.visual_vecs[layer_idx]
+
+        def hook_fn(module, input, output):
+            # Output is (hidden_states,) or (hidden_states, attn_weights)
+            hidden = output[0] if isinstance(output, tuple) else output
+
+            # Apply unconditional steering: h' = h + α * v
+            # vec shape: [n_tokens, hidden_dim]
+            # hidden shape: [batch, seq_len, hidden_dim]
+
+            # Match sequence length if needed
+            seq_len = hidden.shape[1]
+            n_tokens = vec.shape[0]
+
+            if seq_len == n_tokens:
+                # Exact match, apply directly
+                steering = self.alpha_vision * vec.unsqueeze(0)  # [1, n_tokens, hidden_dim]
+            elif seq_len < n_tokens:
+                # Hidden has fewer tokens, truncate vec
+                steering = self.alpha_vision * vec[:seq_len].unsqueeze(0)
+            else:
+                # Hidden has more tokens, pad vec with zeros
+                padding = torch.zeros(seq_len - n_tokens, vec.shape[-1], device=vec.device, dtype=vec.dtype)
+                padded_vec = torch.cat([vec, padding], dim=0)
+                steering = self.alpha_vision * padded_vec.unsqueeze(0)
+
+            modified = hidden + steering.to(hidden.dtype)
+
+            if isinstance(output, tuple):
+                return (modified,) + output[1:]
+            return modified
+
+        return hook_fn
+
+    def register(self):
+        """Register hooks at all specified layers for both text and vision."""
+        # Register textual hooks on Gemma decoder layers (residual stream)
+        # We hook at the output of each GemmaDecoderLayer to add to residual stream
+        for layer_idx in self.text_layer_indices:
+            layer = self.model.paligemma_with_expert.paligemma.language_model.layers[layer_idx]
+            # Hook at the end of the decoder layer (after MLP residual connection)
+            self.text_handles[layer_idx] = layer.register_forward_hook(
+                self._make_text_hook_fn(layer_idx)
+            )
+
+        # Register visual hooks on SigLIP encoder layers (residual stream)
+        # We hook at the output of each SiglipEncoderLayer to add to residual stream
+        for layer_idx in self.vision_layer_indices:
+            layer = self.model.paligemma_with_expert.paligemma.vision_tower.vision_model.encoder.layers[layer_idx]
+            # Hook at the end of the encoder layer (after MLP residual connection)
+            self.vision_handles[layer_idx] = layer.register_forward_hook(
+                self._make_vision_hook_fn(layer_idx)
+            )
+
+        print(f"VTI: Registered hooks for unconditional steering")
+        print(f"  Textual: {len(self.text_layer_indices)} layers (α={self.alpha_text})")
+        print(f"    Layers: {self.text_layer_indices}")
+        print(f"  Visual: {len(self.vision_layer_indices)} layers (α={self.alpha_vision})")
+        print(f"    Layers: {self.vision_layer_indices}")
+
+    def remove(self):
+        """Remove all hooks."""
+        for handle in self.text_handles.values():
+            handle.remove()
+        for handle in self.vision_handles.values():
+            handle.remove()
+
+        self.text_handles.clear()
+        self.vision_handles.clear()
+
+        print(f"VTI: Removed all hooks")
+
+    def step(self):
+        """Increment timestep counter (call after each forward pass)."""
+        self.timestep += 1
+
+    def reset(self):
+        """Reset state for new sequence."""
+        self.timestep = 0
+
+    def get_config_summary(self) -> Dict:
+        """Get summary of VTI configuration."""
+        return {
+            'method': 'VTI',
+            'alpha_text': self.alpha_text,
+            'alpha_vision': self.alpha_vision,
+            'text_layers': self.text_layer_indices,
+            'vision_layers': self.vision_layer_indices,
+            'n_text_layers': len(self.text_layer_indices),
+            'n_vision_layers': len(self.vision_layer_indices)
+        }
+
+
 if __name__ == '__main__':
-    print("CAST Helpers module loaded successfully")
+    print("CAST & VTI Helpers module loaded successfully")
     print("")
     print("Available classes:")
     print("  - CASTMultiLayerHook: Multi-layer CAST with per-layer condition+behavior vectors")
     print("  - MultiPhaseCASTHook: Multi-phase CAST for task phase detection")
+    print("  - VTIHook: Unconditional visual and textual intervention steering")
     print("")
-    print("Vector loading functions:")
+    print("CAST vector loading functions:")
     print("  - load_precomputed_concept_vectors: Load individual concept vectors")
     print("  - load_and_combine_precomputed_vectors: Load and combine for deployment")
     print("  - vectors_exist: Check if precomputed vectors exist")
     print("")
-    print("To compute vectors, use: scripts/precompute_vectors.py")
+    print("VTI vector loading functions:")
+    print("  - load_vti_vectors: Load pre-computed VTI vectors")
+    print("  - get_vti_metadata: Get metadata about VTI vectors")
+    print("")
+    print("To compute vectors:")
+    print("  - CAST: scripts/precompute_vectors_CAST.py")
+    print("  - VTI:  scripts/precompute_vectors_VTI.py")

@@ -24,14 +24,18 @@ from openpi.models_pytorch.CAST_helpers import (
     CASTMultiLayerHook,
     load_layer_cast_config,
     load_and_combine_precomputed_vectors,
-    vectors_exist
+    vectors_exist,
+    # VTI imports
+    VTIHook,
+    load_vti_vectors,
+    get_vti_metadata
 )
 from constants import (
-    ACTIVATION_ENGINEERING,
     CAST,
     PHASE_CAST,
-    USE_GEMMA_BACKBONE,
-    LAYER_INDICES,
+    VTI,
+    VTI_LANGUAGE_LAYER_INDICES,
+    VTI_IMAGE_LAYER_INDICES,
     ALPHA,
     CAST_THRESHOLD,
     CAST_LOG_PATH,
@@ -41,7 +45,8 @@ from constants import (
     CAST_LAYER_CONFIG_NAME,
     NORMALIZE_CONDITION_VECTORS,
     NORMALIZE_BEHAVIOR_VECTORS,
-    RUN_VECTORS_DIR
+    RUN_VECTORS_DIR,
+    VECTORS_DIR
 )
 
 BasePolicy: TypeAlias = _base_policy.BasePolicy
@@ -176,7 +181,7 @@ class Policy(BasePolicy):
             condition_vecs, behavior_vecs = load_and_combine_precomputed_vectors(
                 condition_combination=condition_combination,
                 behavior_combination=behavior_combination,
-                layer_indices=LAYER_INDICES,
+                layer_indices=VTI_LANGUAGE_LAYER_INDICES,
                 normalize_condition=NORMALIZE_CONDITION_VECTORS,
                 normalize_behavior=NORMALIZE_BEHAVIOR_VECTORS,
                 device=self._pytorch_device,
@@ -216,6 +221,53 @@ class Policy(BasePolicy):
             raise NotImplementedError(
                 "PHASE_CAST is not yet supported with precomputed vectors. "
                 "Use CAST=True with a single-phase config instead, or set PHASE_CAST=False."
+            )
+
+        elif VTI:
+            # VTI: Visual and Textual Intervention for hallucination reduction
+            # Based on: "Reducing Hallucinations in Large Vision-Language Models via Latent Space Steering"
+            # Applies unconditional steering to both language model and vision encoder residual streams
+
+            # Determine VTI vectors directory (uses same structure as CAST but under VTI/)
+            # Default to 70 demos if not specified otherwise
+            vti_num_demos = 70  # Default number of demos used for VTI vector computation
+            vti_vectors_dir = VECTORS_DIR / "VTI" / str(vti_num_demos)
+
+            # Check if VTI vectors exist
+            vti_metadata = get_vti_metadata(vti_vectors_dir)
+            if vti_metadata is None:
+                raise FileNotFoundError(
+                    f"VTI vectors not found at {vti_vectors_dir}. "
+                    f"Run scripts/precompute_vectors_VTI.py first to compute vectors."
+                )
+
+            print(f"VTI: Loading pre-computed vectors from {vti_vectors_dir}")
+            print(f"  Computed at: {vti_metadata.get('computed_at', 'unknown')}")
+            print(f"  Num demos: {vti_metadata.get('num_demos', 'unknown')}")
+
+            # Load VTI vectors for specified layers
+            textual_vecs, visual_vecs = load_vti_vectors(
+                layer_indices_text=VTI_LANGUAGE_LAYER_INDICES,
+                layer_indices_vision=VTI_IMAGE_LAYER_INDICES,
+                vectors_dir=vti_vectors_dir,
+                device=self._pytorch_device
+            )
+
+            # Get alpha values from metadata (or use defaults)
+            alpha_text = vti_metadata.get('alpha_text', 1.0)
+            alpha_vision = vti_metadata.get('alpha_image', 1.0)
+
+            print(f"VTI: Creating hook with alpha_text={alpha_text}, alpha_vision={alpha_vision}")
+
+            # Create VTI hook
+            self.vti_hook = VTIHook(
+                model=self._model,
+                textual_vecs=textual_vecs,
+                visual_vecs=visual_vecs,
+                alpha_text=alpha_text,
+                alpha_vision=alpha_vision,
+                normalize_text=False,
+                normalize_vision=False
             )
 
     @override

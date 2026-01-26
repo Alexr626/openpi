@@ -36,7 +36,7 @@ import numpy as np
 
 # Import constants and helpers
 from constants import (
-    LAYER_INDICES,
+    VTI_LANGUAGE_LAYER_INDICES,
     ALPHA,
     CAST_THRESHOLD,
     CAST_LAYER_CONFIG_PATH,
@@ -259,7 +259,7 @@ class CASTMultiLayerHookForPaliGemma:
 
 def load_vlm_vectors(
     config_name: str = CAST_LAYER_CONFIG_NAME,
-    layer_indices: List[int] = LAYER_INDICES,
+    layer_indices: List[int] = VTI_LANGUAGE_LAYER_INDICES,
     vectors_dir: Path = VLM_VECTORS_DIR,
     device: str = "cuda"
 ) -> Tuple[Dict[int, torch.Tensor], Dict[int, torch.Tensor], Dict]:
@@ -338,7 +338,7 @@ def load_vlm_vectors(
 
 def run_cast_experiment(
     task_prompt: str = TASK_PROMPT,
-    layer_indices: List[int] = LAYER_INDICES,
+    layer_indices: List[int] = VTI_LANGUAGE_LAYER_INDICES,
     alpha: float = ALPHA,
     threshold: float = CAST_THRESHOLD,
     max_new_tokens: int = MAX_NEW_TOKENS,
@@ -534,7 +534,7 @@ def run_steering_only_experiment(
     print(f"\n2. Loading precomputed vectors...")
     condition_vecs, behavior_vecs, config = load_vlm_vectors(
         config_name=CAST_LAYER_CONFIG_NAME,
-        layer_indices=LAYER_INDICES,
+        layer_indices=VTI_LANGUAGE_LAYER_INDICES,
         vectors_dir=VLM_VECTORS_DIR,
         device=device
     )

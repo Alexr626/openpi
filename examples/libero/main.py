@@ -2,12 +2,16 @@ import collections
 import dataclasses
 import logging
 import math
+import os
 import pathlib
+import platform
+import random
+import sys
 
 import imageio
 from libero.libero import benchmark
 from libero.libero import get_libero_path
-from libero.libero.envs import OffScreenRenderEnv
+from libero.libero.envs.env_wrapper import ControlEnv
 import numpy as np
 from openpi_client import image_tools
 from openpi_client import websocket_client_policy as _websocket_client_policy
@@ -41,19 +45,59 @@ class Args:
     # Utils
     #################################################################################################################
     video_out_path: str = "data/libero/videos"  # Path to save videos
+    render: bool = False  # Enable on-screen rendering to visualize the simulation
 
     seed: int = 7  # Random Seed (for reproducibility)
+    num_seeds: int = 1  # Number of seeds to run (for statistical significance)
 
 
-def eval_libero(args: Args) -> None:
-    # Set random seed
-    np.random.seed(args.seed)
+def log_environment_info(args: Args) -> None:
+    """Log environment information for reproducibility."""
+    logging.info("=" * 60)
+    logging.info("ENVIRONMENT INFORMATION")
+    logging.info("=" * 60)
+    logging.info(f"Python version: {sys.version}")
+    logging.info(f"Platform: {platform.platform()}")
+    logging.info(f"Seed: {args.seed}")
+
+    # Log package versions
+    import mujoco
+    import robosuite
+    logging.info(f"NumPy version: {np.__version__}")
+    logging.info(f"MuJoCo version: {mujoco.__version__}")
+    logging.info(f"Robosuite version: {robosuite.__version__}")
+
+    # Log GPU info if available
+    try:
+        import torch
+        logging.info(f"PyTorch version: {torch.__version__}")
+        if torch.cuda.is_available():
+            logging.info(f"CUDA version: {torch.version.cuda}")
+            logging.info(f"cuDNN version: {torch.backends.cudnn.version()}")
+            logging.info(f"GPU: {torch.cuda.get_device_name(0)}")
+    except ImportError:
+        pass
+
+    # Log relevant environment variables
+    env_vars = ["MUJOCO_GL", "CUBLAS_WORKSPACE_CONFIG", "PYTHONHASHSEED"]
+    for var in env_vars:
+        val = os.environ.get(var, "not set")
+        logging.info(f"{var}: {val}")
+
+    logging.info("=" * 60)
+
+
+def eval_libero_single_seed(args: Args, seed: int, client) -> float:
+    """Run evaluation for a single seed. Returns success rate."""
+    # Set random seeds for reproducibility
+    random.seed(seed)
+    np.random.seed(seed)
 
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[args.task_suite_name]()
     num_tasks_in_suite = task_suite.n_tasks
-    logging.info(f"Task suite: {args.task_suite_name}")
+    logging.info(f"Task suite: {args.task_suite_name}, Seed: {seed}")
 
     pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
 
@@ -70,8 +114,6 @@ def eval_libero(args: Args) -> None:
     else:
         raise ValueError(f"Unknown task suite: {args.task_suite_name}")
 
-    client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
-
     # Start evaluation
     total_episodes, total_successes = 0, 0
     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
@@ -82,7 +124,7 @@ def eval_libero(args: Args) -> None:
         initial_states = task_suite.get_task_init_states(task_id)
 
         # Initialize LIBERO environment and task description
-        env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
+        env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, seed, args.render)
 
         # Start episodes
         task_episodes, task_successes = 0, 0
@@ -151,6 +193,8 @@ def eval_libero(args: Args) -> None:
 
                     # Execute action in environment
                     obs, reward, done, info = env.step(action.tolist())
+                    if args.render:
+                        env.env.render()
                     if done:
                         task_successes += 1
                         total_successes += 1
@@ -182,16 +226,57 @@ def eval_libero(args: Args) -> None:
         logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
         logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
 
-    logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
+    success_rate = float(total_successes) / float(total_episodes)
+    logging.info(f"Total success rate for seed {seed}: {success_rate}")
     logging.info(f"Total episodes: {total_episodes}")
+    return success_rate
 
 
-def _get_libero_env(task, resolution, seed):
+def eval_libero(args: Args) -> None:
+    """Main evaluation function that runs over multiple seeds."""
+    # Log environment info for reproducibility
+    log_environment_info(args)
+
+    # Create client once (shared across seeds)
+    client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
+
+    # Run evaluation over multiple seeds
+    seeds = [args.seed + i for i in range(args.num_seeds)]
+    success_rates = []
+
+    for seed in seeds:
+        logging.info("=" * 60)
+        logging.info(f"RUNNING EVALUATION WITH SEED {seed}")
+        logging.info("=" * 60)
+        success_rate = eval_libero_single_seed(args, seed, client)
+        success_rates.append(success_rate)
+
+    # Log aggregated results
+    logging.info("=" * 60)
+    logging.info("FINAL RESULTS ACROSS ALL SEEDS")
+    logging.info("=" * 60)
+    for seed, rate in zip(seeds, success_rates):
+        logging.info(f"Seed {seed}: {rate * 100:.1f}%")
+
+    mean_rate = np.mean(success_rates)
+    std_rate = np.std(success_rates)
+    logging.info(f"Mean success rate: {mean_rate * 100:.1f}% (+/- {std_rate * 100:.1f}%)")
+    logging.info(f"Seeds used: {seeds}")
+
+
+def _get_libero_env(task, resolution, seed, render=False):
     """Initializes and returns the LIBERO environment, along with the task description."""
     task_description = task.language
     task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
-    env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution}
-    env = OffScreenRenderEnv(**env_args)
+    env_args = {
+        "bddl_file_name": task_bddl_file,
+        "camera_heights": resolution,
+        "camera_widths": resolution,
+        "has_renderer": render,
+        "has_offscreen_renderer": True,
+        "render_camera": "agentview",
+    }
+    env = ControlEnv(**env_args)
     env.seed(seed)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
     return env, task_description
 

@@ -40,7 +40,8 @@ dependencies = [
     "polars>=1.30.0",
     "bitsandbytes==0.48.1",
     "python-dotenv",
-    "tensorflow_datasets"
+    "tensorflow_datasets",
+    "scikit-learn"
 ]
 
 

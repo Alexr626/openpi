@@ -8,7 +8,7 @@ from openpi_client import base_policy as _base_policy
 from openpi_client import msgpack_numpy
 import websockets.asyncio.server as _server
 import websockets.frames
-from constants import ACTIVATION_ENGINEERING, CAST, PHASE_CAST
+from constants import ACTIVATION_ENGINEERING, CAST, PHASE_CAST, VTI
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +64,9 @@ class WebsocketPolicyServer:
             for hook in self._policy.multi_phase_hooks:
                 hook.register()
             logger.info(f"Multi-Phase CAST: Registered {len(self._policy.multi_phase_hooks)} hooks")
+        elif VTI:
+            self._policy.vti_hook.register()
+            logger.info(f"VTI: Registered visual and textual intervention hooks")
 
         while True:
             try:
@@ -104,6 +107,9 @@ class WebsocketPolicyServer:
             for hook in self._policy.multi_phase_hooks:
                 hook.remove()
             logger.info(f"Multi-Phase CAST: Removed {len(self._policy.multi_phase_hooks)} hooks")
+        elif VTI:
+            self._policy.vti_hook.remove()
+            logger.info("VTI: Removed visual and textual intervention hooks")
 
 
 def _health_check(connection: _server.ServerConnection, request: _server.Request) -> _server.Response | None:
